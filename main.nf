@@ -894,7 +894,8 @@ workflow {
 		: fastp.out.trimmed_fastq
 	fastqc(ch_trimmed)
 	summary_fastqc(fastqc.out.fastqc_zip.collect())
-	shovill(ch_samplesheet_illumina)
+	ch_shovill_reads = ch_trimmed.map { sample, r1, r2, r1t, r2t -> tuple(sample, r1t, r2t) }
+	shovill(ch_shovill_reads)
 	summary_shovill(shovill.out.assembly_fasta.collect())
 	quast(shovill.out.assembly_out)
 	summary_quast(quast.out.quast_results.collect())
