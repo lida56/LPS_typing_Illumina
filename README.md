@@ -82,6 +82,35 @@ The LPS type is determined from the assembled genome using [Kaptive](https://kap
 - [SnpEff](https://pcingola.github.io/SnpEff/) annotates variant effects on genes and proteins.
 - High-impact variants (frameshift, stop_gained) are extracted to a separate file.
 
+#### Majority-allele 0/1 calls
+
+Snippy runs freebayes in diploid mode and keeps only homozygous-alt (`GT=1/1`) calls, which is its intended design ([tseemann/snippy#343](https://github.com/tseemann/snippy/issues/343)).
+A real allele with a minority of reference-supporting reads is genotyped `0/1` and never reaches `snps.tab`.
+In the publication cohort this hid one typing allele: PM1533 natC 859 A>ATATTTAT (L3-8), a 7 bp insertion in a tandem repeat with 231 of 296 reads supporting it (AF 0.78).
+No snippy option recovers it: `--minfrac` already defaults to 0, and haploid freebayes (`-p 1`) writes `GT=1`, which snippy's filter then drops entirely.
+
+The pipeline therefore rebuilds `snps.tab` from `snps.raw.vcf` with `bin/snippy_typing_calls.sh`:
+
+- Records passing snippy's own rule are kept unchanged (`GT=1/1`, QUAL >= `--snippy_minqual`, depth >= `--snippy_mincov`, AO/DP >= `--snippy_minfrac`).
+- Biallelic `GT=0/1` records with the same QUAL and depth and AO/DP >= `--snippy_het_min_af` (default 0.5) are added.
+- The selected records go through the same `vt normalize`, snpEff and `snippy-vcf_to_tab` steps snippy uses, so the table schema and subtype matching are unchanged.
+
+The 0.5 default is the majority allele, the right genotype for a haploid isolate, and matches the AF >= 0.5 rule recommended for the ONT pipeline.
+In the PM1533 BAM, non-reference noise is at most 0.12 per position and indel noise at most 0.006, so any value from about 0.15 up to 0.77 gives the same results on the 48-isolate cohort.
+Across those isolates the rule adds exactly one record (PM1533 859) to snippy's calls.
+
+A rescued call means the majority allele is present.
+It can also reflect a minor subpopulation, library-prep stutter or a repeat-length difference between preparations.
+Each one is listed in `sample_id_snps.rescued.tsv` with its allele fraction and a `heterogeneous` flag (AF < 0.9).
+
+Notes:
+
+- `snps.raw.vcf`, `snps.filt.vcf` and the BAM are snippy's own and untouched; snippy's original table is kept as `sample_id_snps.snippy.tab`.
+- Snippy's consensus and alignment FASTA files (not published) do not include rescued alleles.
+- Set `--snippy_het_min_af false` to reproduce plain snippy output exactly.
+- The snippy process ignores errors, so a sample whose snippy or typing step fails is missing from the subtype report rather than stopping the run; check `sample_id_snippy.log`.
+- `tests/test_snippy_typing_calls.sh` checks the script against PM1533's snippy output (see the header of that file for how to run it in the snippy container).
+
 ### 9. MLST typing
 
 [mlst](https://github.com/tseemann/mlst) scans assemblies against the PubMLST scheme `pmultocida_2` (RIRDC) by default. The scheme can be changed with `--mlst_scheme`.
@@ -309,7 +338,11 @@ tar -xvzf db.tar.gz -C /path/to/databases/bakta/
 
 * `--skip_snippy`: skip the Snippy variant calling step (default=false)
 * `--snippy_threads`: number of threads for Snippy (default=6)
-* `--snippy_args`: additional Snippy parameters (default="")
+* `--snippy_args`: additional Snippy parameters (default=""). Do not pass `--minqual`, `--mincov` or `--minfrac` here; use the options below.
+* `--snippy_minqual`: minimum QUAL for a call (default=100, as Snippy)
+* `--snippy_mincov`: minimum read depth for a call (default=10, as Snippy)
+* `--snippy_minfrac`: minimum alt fraction for `1/1` calls (default=0, as Snippy)
+* `--snippy_het_min_af`: minimum alt fraction for freebayes `0/1` calls to be kept in `snps.tab`, or `false` to keep Snippy's `1/1`-only filter (default=0.5). See [Majority-allele 0/1 calls](#majority-allele-01-calls).
 * `--reference_LPS_directory`: path to the LPS reference directory containing `reference_LPS.txt`, `LPS_subtype_database_v2.txt`, `petG_X73_NZ_CM001580.fasta`, and FASTA/GB files for all LPS types (default=`databases/LPS`)
 
 ### 9. MLST typing
@@ -369,11 +402,15 @@ Each sample folder contains:
   * LPS type results (`sample_id_kaptive_results.tsv`)
   * LPS sequence in FASTA format (`sample_id_kaptive_results.fna`)
 * **8_snippy:** Snippy mapping and variant calling results. See [Snippy output docs](https://github.com/tseemann/snippy?tab=readme-ov-file#output-files).
-  * BAM alignment file (`sample_id_snps.bam_mapped.bam` and `.bai` index)
-  * Unfiltered variants VCF (`sample_id_clair_snps.raw.vcf`)
-  * Filtered variants VCF (`sample_id_snps.filt.vcf`)
-  * Variant summary in tabular format (`sample_id_snps.tab`)
+  * BAM alignment file (`sample_id_snps.bam` and `.bai` index)
+  * Unfiltered variants VCF (`sample_id_snps.raw.vcf`)
+  * Filtered variants VCF, Snippy's `1/1` calls (`sample_id_snps.filt.vcf`)
+  * Variant summary in tabular format, including majority-allele `0/1` calls (`sample_id_snps.tab`)
   * High-impact variants (frameshift, stop_gained) (`sample_id_snps.high_impact.tab`)
+  * Annotated VCF behind `sample_id_snps.tab` (`sample_id_snps.typing.vcf`)
+  * Snippy's own `1/1`-only table (`sample_id_snps.snippy.tab`)
+  * Calls added over Snippy's filter, with allele fraction (`sample_id_snps.rescued.tsv`)
+  * Snippy log (`sample_id_snippy.log`)
 * **9_mlst:** MLST typing result (`sample_id_mlst_pmultocida_rirdc.csv`).
 * **13_petG:** petG BLAST output files.
   * BLAST tabular output for all hits (`sample_id_petG_blast.tsv`)

@@ -1,0 +1,3 @@
+CHROM	POS	TYPE	REF	ALT	EVIDENCE	FTYPE	STRAND	NT_POS	AA_POS	EFFECT	LOCUS_TAG	GENE	PRODUCT
+L3_NC002663_LPS	2455	snp	A	G	G:362 A:0	CDS	-	807/1014	269/337	synonymous_variant c.807T>C p.Ile269Ile	PM_RS05945	natB	glycosyltransferase family 2 protein
+L3_NC002663_LPS	2775	snp	G	A	A:350 G:0	CDS	-	487/1014	163/337	missense_variant c.487C>T p.Arg163Cys	PM_RS05945	natB	glycosyltransferase family 2 protein

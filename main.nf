@@ -40,6 +40,18 @@ if (params.help){
     exit 0
 }
 
+// Snippy takes the last value of a repeated option, so thresholds in snippy_args would
+// silently diverge from those snippy_typing_calls.sh applies
+if (params.snippy_args =~ /--min(qual|cov|frac)\b/) {
+    error "Set --snippy_minqual/--snippy_mincov/--snippy_minfrac instead of passing them in --snippy_args"
+}
+// false (or null in a config file) turns the 0/1 rescue off; anything else must be a fraction.
+// Checked here because the snippy process ignores errors and would drop samples silently
+def snippy_het_min_af = params.snippy_het_min_af
+if (snippy_het_min_af != null && snippy_het_min_af != false && !(snippy_het_min_af instanceof Number && snippy_het_min_af > 0 && snippy_het_min_af <= 1)) {
+    error "--snippy_het_min_af must be a fraction in (0, 1], or false to disable (got '${snippy_het_min_af}')"
+}
+
 process fastp {
 	cpus "${params.threads}"
 	tag "${sample}"
@@ -424,14 +436,27 @@ process snippy {
                 tuple val(sample), path("*snps.tab"), path("*snps.high_impact.tab"), path("snps.raw.vcf"), path("snps.filt.vcf"),  path("snps.bam"), path("snps.bam.bai"),  emit: snippy_results
 		path("snippy.log")
 		tuple path("*snps.tab"), path("*snps.high_impact.tab"), emit: snippy_impact_tab
+		// Typing call set evidence; absent when snippy_het_min_af is false
+		path("snps.typing.vcf"), optional: true
+		path("snps.rescued.tsv"), optional: true
+		path("*_snps.snippy.tab"), optional: true
         when:
         !params.skip_snippy && !params.skip_kaptive3
         script:
+        // Rebuild snps.tab from snps.raw.vcf to keep majority-allele 0/1 calls that snippy drops
+        def typing_calls = params.snippy_het_min_af != null && params.snippy_het_min_af != false ? """
+	snippy_typing_calls.sh --raw snps.raw.vcf --filt snps.filt.vcf --refdir reference \\
+		--minqual ${params.snippy_minqual} --mincov ${params.snippy_mincov} --minfrac ${params.snippy_minfrac} --het-min-af ${params.snippy_het_min_af}
+	# Keep snippy's own table for comparison; the name must not end in snps.tab
+	mv snps.tab ${sample}_snps.snippy.tab
+	mv snps.typing.tab snps.tab
+	""" : ""
         """
 	locus=\$(tail -1 "${kaptive_report}" | cut -f3)
 	ref_gb=\$(grep \${locus:0:2} "${params.reference_LPS_directory}/reference_LPS.txt" | cut -f2)
 	ref_gb="${params.reference_LPS_directory}/\$ref_gb"
-	snippy --cpus ${params.snippy_threads} --force --outdir \$PWD --ref \${ref_gb} --R1 ${reads1_trimmed} --R2 ${reads2_trimmed} ${params.snippy_args}
+	snippy --cpus ${params.snippy_threads} --force --outdir \$PWD --ref \${ref_gb} --R1 ${reads1_trimmed} --R2 ${reads2_trimmed} --minqual ${params.snippy_minqual} --mincov ${params.snippy_mincov} --minfrac ${params.snippy_minfrac} ${params.snippy_args}
+	${typing_calls}
         egrep "^CHROM|frameshift_variant|stop_gained" snps.tab > snps.high_impact.tab
 	mv snps.high_impact.tab ${sample}_snps.high_impact.tab
 	mv snps.tab ${sample}_snps.tab
