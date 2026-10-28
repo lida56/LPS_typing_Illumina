@@ -86,8 +86,8 @@ The LPS type is determined from the assembled genome using [Kaptive](https://kap
 
 Snippy runs freebayes in diploid mode and keeps only homozygous-alt (`GT=1/1`) calls, which is its intended design ([tseemann/snippy#343](https://github.com/tseemann/snippy/issues/343)).
 A real allele with a minority of reference-supporting reads is genotyped `0/1` and never reaches `snps.tab`.
-In the publication cohort this hid one typing allele: PM1533 natC 859 A>ATATTTAT (L3-8), a 7 bp insertion in a tandem repeat with 231 of 296 reads supporting it (AF 0.78).
-No snippy option recovers it: `--minfrac` already defaults to 0, and haploid freebayes (`-p 1`) writes `GT=1`, which snippy's filter then drops entirely.
+This typically affects indels in tandem repeats, where a fraction of reads support a different repeat length, and can hide a typing allele.
+No snippy option recovers such calls: `--minfrac` already defaults to 0, and haploid freebayes (`-p 1`) writes `GT=1`, which snippy's filter then drops entirely.
 
 The pipeline therefore rebuilds `snps.tab` from `snps.raw.vcf` with `bin/snippy_typing_calls.sh`:
 
@@ -95,9 +95,8 @@ The pipeline therefore rebuilds `snps.tab` from `snps.raw.vcf` with `bin/snippy_
 - Biallelic `GT=0/1` records with the same QUAL and depth and AO/DP >= `--snippy_het_min_af` (default 0.5) are added.
 - The selected records go through the same `vt normalize`, snpEff and `snippy-vcf_to_tab` steps snippy uses, so the table schema and subtype matching are unchanged.
 
-The 0.5 default is the majority allele, the right genotype for a haploid isolate, and matches the AF >= 0.5 rule recommended for the ONT pipeline.
-In the PM1533 BAM, non-reference noise is at most 0.12 per position and indel noise at most 0.006, so any value from about 0.15 up to 0.77 gives the same results on the 48-isolate cohort.
-Across those isolates the rule adds exactly one record (PM1533 859) to snippy's calls.
+The 0.5 default keeps the majority allele, which is the genotype of a haploid isolate.
+Per-position sequencing noise at typical depths sits well below this, so the value mainly decides how minority alleles are treated rather than separating signal from noise.
 
 A rescued call means the majority allele is present.
 It can also reflect a minor subpopulation, library-prep stutter or a repeat-length difference between preparations.
@@ -109,7 +108,7 @@ Notes:
 - Snippy's consensus and alignment FASTA files (not published) do not include rescued alleles.
 - Set `--snippy_het_min_af false` to reproduce plain snippy output exactly.
 - The snippy process ignores errors, so a sample whose snippy or typing step fails is missing from the subtype report rather than stopping the run; check `sample_id_snippy.log`.
-- `tests/test_snippy_typing_calls.sh` checks the script against PM1533's snippy output (see the header of that file for how to run it in the snippy container).
+- `tests/test_snippy_typing_calls.sh` checks the script against a fixture snippy output (see the header of that file for how to run it in the snippy container).
 
 ### 9. MLST typing
 

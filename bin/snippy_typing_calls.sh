@@ -4,8 +4,8 @@
 # alt fraction is a majority.
 #
 # Snippy 4.6.0 runs freebayes in diploid mode (-p 2) and keeps only GT=1/1, so a
-# real haploid allele with a minority of reference reads (e.g. PM1533 natC 859,
-# AF 0.78, GT 0/1) never reaches snps.tab (tseemann/snippy#343). This script
+# real haploid allele with a minority of reference reads (e.g. a repeat-length
+# indel at AF 0.78, GT 0/1) never reaches snps.tab (tseemann/snippy#343). This script
 # re-applies snippy's own rule, adds 0/1 records with AF >= --het-min-af, and
 # then runs the same normalise / annotate / tab steps snippy does, so every
 # record snippy keeps comes out byte-identical.
