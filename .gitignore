@@ -10,3 +10,5 @@ venv/
 env/
 __pycache__/
 *.py[cod]
+*handoff.md
+HANDOFF.md
