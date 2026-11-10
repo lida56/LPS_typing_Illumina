@@ -38,6 +38,7 @@ from jinja2 import Template  # noqa: E402
 # Known aggregated filenames in 10_report/ (the "Illumina" infix is fixed in the
 # pipeline). Each is optional except the subtype report.
 F_SUBTYPE = "10_Illumina_subtype_report.tsv"
+F_PHENOTYPE = "10_Illumina_phenotype_report.tsv"  # one row per sample (lps_phenotype.py)
 F_KAPTIVE = "7_Illumina_kaptive_results.tsv"
 F_QUAST = "4_Illumina_quast_report.tsv"
 F_SHOVILL = "3_Illumina_shovill_stats.tsv"
@@ -464,10 +465,35 @@ def parse_quast(df):
     return out
 
 
-def build_records(report_df, qc):
-    """Collapse the multi-row subtype report into one record per genome."""
+PETG_CLASS = {"functional": "ok", "nonfunctional": "bad", "absent": "bad", "uncertain": "flag"}
+
+
+def basis_categories(basis):
+    """Short labels for the PHENOTYPE_BASIS text, used for badges and filtering."""
+    basis = clean(basis)
+    if not basis:
+        return []
+    labels = []
+    for text, label in (("uncertain", "uncertain"), ("uncurated", "uncurated"),
+                        ("low-confidence call", "low-confidence"), ("mixed call", "mixed call"),
+                        ("untypeable", "untypeable"), ("no phenotype rules", "no rules")):
+        if text in basis:
+            labels.append(label)
+    if not labels or basis.startswith("curated"):
+        labels.insert(0, "curated")
+    return labels
+
+
+def build_records(report_df, qc, pheno_df=None):
+    """Collapse the multi-row subtype report into one record per genome.
+
+    Phenotype, petG status and the phenotype basis come from the per-sample
+    phenotype report when it is available.
+    """
+    pheno = index_by_sample(pheno_df, "SAMPLE") if pheno_df is not None else {}
     records = OrderedDict()
-    for s in sorted({clean(v) for v in report_df["SAMPLE"] if clean(v)}):
+    samples = {clean(v) for v in report_df["SAMPLE"] if clean(v)} | set(pheno)
+    for s in sorted(samples):
         rows = report_df[report_df["SAMPLE"] == s]
         types = sorted({clean(r["TYPE"]) for _, r in rows.iterrows() if clean(r["TYPE"])})
         subtypes = sorted({clean(r["SUBTYPE"]) for _, r in rows.iterrows() if clean(r["SUBTYPE"])})
@@ -496,6 +522,23 @@ def build_records(report_df, qc):
                 })
 
         lps_type = types[0] if types else ""
+        ph_row = pheno.get(s)
+        basis = ""
+        gene_states = ""
+        petg_detail = ""
+        if ph_row is not None:
+            phenos = OrderedDict()
+            names = [p.strip() for p in clean(ph_row.get("PREDICTED_PHENOTYPE")).split("|") if p.strip()]
+            descs = [d.strip() for d in clean(ph_row.get("PREDICTED_PHENOTYPE_DESCRIPTION")).split("|")]
+            for i, name in enumerate(names):
+                phenos[name] = descs[i] if i < len(descs) else ""
+            petg = clean(ph_row.get("PETG_STATUS"))
+            petg_detail = clean(ph_row.get("PETG_DETAIL"))
+            basis = clean(ph_row.get("PHENOTYPE_BASIS"))
+            gene_states = clean(ph_row.get("LPS_GENE_STATES"))
+            lps_type = clean(ph_row.get("TYPE")) or lps_type
+            mlst = mlst or clean(ph_row.get("MLST"))
+            subtypes = [t for t in clean(ph_row.get("SUBTYPES")).split(";") if t] or subtypes
         # QC joins
         ck = qc["checkm"].get(s, {})
         completeness = clean(ck.get("Completeness"))
@@ -529,6 +572,11 @@ def build_records(report_df, qc):
             "phenotypes": phenos,
             "variants": variants,
             "petg": petg or "no",
+            "petg_class": PETG_CLASS.get(petg, ""),
+            "petg_detail": petg_detail,
+            "basis": basis,
+            "basis_labels": basis_categories(basis),
+            "gene_states": gene_states,
             "mlst": mlst,
             "species": species,
             "completeness": completeness,
@@ -644,10 +692,15 @@ TEMPLATE = r"""<!DOCTYPE html>
   .data-table tr.filter-row .range { display: flex; gap: 4px; }
   .data-table tr.filter-row .range input { width: 50%; }
   tr:hover td { background: #fafbfc; }
-  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; background: #eaeef2; margin: 1px 2px; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; background: #eaeef2; margin: 1px 2px; white-space: nowrap; }
+  .nowrap { white-space: nowrap; }
   .flag { background: var(--warn-bg); color: var(--warn-fg); }
   .flag.untypeable { background: #ffd8d3; color: var(--danger); }
   .ok { color: #1a7f37; }
+  .bad { color: var(--danger); }
+  .pill.basis-curated { background: #dafbe1; color: #1a7f37; }
+  .pill.basis-uncertain, .pill.basis-mixed, .pill.basis-low-confidence { background: var(--warn-bg); color: var(--warn-fg); }
+  .pill.basis-uncurated { background: #ddf4ff; color: #0550ae; }
   .tablebar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 8px 0 12px; }
   .tablebar input[type=text] { font-size: 14px; padding: 7px 10px; width: 280px; border: 1px solid var(--line); border-radius: 6px; }
   .count { color: var(--muted); font-size: 13px; }
@@ -693,7 +746,7 @@ TEMPLATE = r"""<!DOCTYPE html>
 <div class="cards">
   <div class="metric"><div class="v">{{ records|length }}</div><div class="l">genomes</div></div>
   <div class="metric"><div class="v">{{ type_counts|length }}</div><div class="l">LPS types</div></div>
-  <div class="metric"><div class="v">{{ pheno_counts|length }}</div><div class="l">phenotypes</div></div>
+  <div class="metric"><div class="v">{{ pheno_counts|reject("equalto", "uncertain")|list|length }}</div><div class="l">phenotypes</div></div>
   <div class="metric"><div class="v">{{ n_flagged }}</div><div class="l">flagged genomes</div></div>
 </div>
 {% if meta.steps %}<p class="sub"><b>Steps run:</b> {{ meta.steps }}</p>{% endif %}
@@ -710,6 +763,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   <thead><tr>
     <th data-filter="text">Sample</th><th data-filter="select">Species</th>
     <th data-filter="select">Type</th><th data-filter="multi">Subtype(s)</th><th data-filter="multi">Phenotype</th>
+    <th data-filter="multi">Basis</th>
     <th data-filter="select">MLST</th><th data-filter="select">petG</th>
     <th data-type="num" data-filter="range">Compl.</th><th data-type="num" data-filter="range">Contam.</th><th data-filter="multi">Flags</th>
   </tr></thead>
@@ -721,8 +775,9 @@ TEMPLATE = r"""<!DOCTYPE html>
       <td>{{ r.type or "—" }}</td>
       <td data-sort="{{ r.subtypes|join(', ') }}">{% for s in r.subtypes %}<span class="pill">{{ s }}</span>{% else %}<span class="muted">—</span>{% endfor %}</td>
       <td data-sort="{{ r.phenotypes.keys()|join(', ') }}">{% for p, d in r.phenotypes.items() %}<span class="pill" title="{{ d }}">{{ p }}</span>{% else %}<span class="muted">—</span>{% endfor %}</td>
+      <td data-sort="{{ r.basis_labels|join(', ') }}">{% for b in r.basis_labels %}<span class="pill basis-{{ b.split(' ')[0] }}" title="{{ r.basis }}">{{ b }}</span>{% else %}<span class="muted">—</span>{% endfor %}</td>
       <td>{{ r.mlst or "—" }}</td>
-      <td data-sort="{{ r.petg }}">{% if r.petg == "yes" %}<span class="ok">yes</span>{% else %}no{% endif %}</td>
+      <td data-sort="{{ r.petg }}"><span class="nowrap {{ r.petg_class }}" title="{{ r.petg_detail }}">{{ r.petg }}</span></td>
       <td>{{ r.completeness or "—" }}</td>
       <td>{{ r.contamination or "—" }}</td>
       <td data-sort="{{ r.flags|join(', ') }}">{% for f in r.flags %}<span class="pill flag {{ 'untypeable' if f == 'untypeable' else '' }}">{{ f }}</span>{% else %}<span class="muted">—</span>{% endfor %}</td>
@@ -833,7 +888,9 @@ TEMPLATE = r"""<!DOCTYPE html>
         <span class="k">Subtype(s)</span><span>{{ r.subtypes|join(", ") or "—" }}</span>
         <span class="k">Phenotype</span><span>{% for p,d in r.phenotypes.items() %}{{ p }}{% if d %} ({{ d }}){% endif %}{% if not loop.last %}; {% endif %}{% else %}—{% endfor %}</span>
         <span class="k">MLST</span><span>{{ r.mlst or "—" }}</span>
-        <span class="k">petG</span><span>{{ r.petg }}</span>
+        <span class="k">Phenotype basis</span><span>{{ r.basis or "—" }}</span>
+        <span class="k">LPS gene states</span><span>{{ r.gene_states or "all rule genes functional" }}</span>
+        <span class="k">petG</span><span><span class="{{ r.petg_class }}">{{ r.petg }}</span>{% if r.petg_detail %} <span class="muted">({{ r.petg_detail }})</span>{% endif %}</span>
         <span class="k">Species</span><span><i>{{ r.species or "—" }}</i></span>
         <span class="k">Completeness / contam.</span><span>{{ r.completeness or "—" }} / {{ r.contamination or "—" }}</span>
         <span class="k">Kaptive</span><span>{{ r.kaptive_confidence or "—" }} (id {{ r.kaptive_identity or "—" }}, cov {{ r.kaptive_coverage or "—" }})</span>
@@ -1044,7 +1101,7 @@ def main(argv=None):
     gene_colors = load_gene_colors(lps)
     pheno_images = load_phenotype_images(lps)
 
-    records = build_records(report_df, qc)
+    records = build_records(report_df, qc, read_tsv(rdir / F_PHENOTYPE))
     attach_amr(records, read_tsv(rdir / F_AMR))
 
     # attach per-genome phenotype image (first phenotype with an image)
@@ -1065,8 +1122,12 @@ def main(argv=None):
         type_counts[t] = type_counts.get(t, 0) + 1
         if r["mlst"]:
             mlst_counts[r["mlst"]] = mlst_counts.get(r["mlst"], 0) + 1
+        # An uncertain call lists several alternatives; count it once, as "uncertain".
+        if len(r["phenotypes"]) > 1:
+            pheno_counts["uncertain"] = pheno_counts.get("uncertain", 0) + 1
         for p, d in r["phenotypes"].items():
-            pheno_counts[p] = pheno_counts.get(p, 0) + 1
+            if len(r["phenotypes"]) == 1:
+                pheno_counts[p] = pheno_counts.get(p, 0) + 1
             pheno_desc[p] = d
 
     distributions = []
@@ -1082,7 +1143,7 @@ def main(argv=None):
 
     # phenotype gallery (observed, sorted)
     pheno_gallery = []
-    for p in sorted(pheno_counts):
+    for p in sorted(k for k in pheno_counts if k != "uncertain"):
         pheno_gallery.append({
             "id": p, "desc": (": " + pheno_desc[p]) if pheno_desc.get(p) else "",
             "count": pheno_counts[p], "img": pheno_images.get(p),
@@ -1094,7 +1155,8 @@ def main(argv=None):
     has_amr = any(r["amr"] for r in records.values())
 
     db_files = ", ".join(sorted(
-        p.name for p in [lps / "LPS_subtype_database_v2.txt",
+        p.name for p in [lps / "LPS_subtype_database_v3.txt",
+                         lps / "phenotype_rules.tsv",
                          lps / "phenotype_lookup.tsv"] if p.exists()))
 
     meta = {

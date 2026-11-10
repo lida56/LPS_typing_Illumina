@@ -135,13 +135,75 @@ A pre-downloaded database (2026-08-18) is included at `databases/mlst_db/`.
 
 ### 10. petG detection
 
-[BLAST](https://blast.ncbi.nlm.nih.gov/Blast.cgi) v2.17.0 searches the assembly for *petG* using the reference sequence `petG_X73_NZ_CM001580.fasta` (included in `databases/LPS/`). petG is reported as present when a hit spans > 1570 bp at ≥ 95% identity.
+[BLAST](https://blast.ncbi.nlm.nih.gov/Blast.cgi) v2.17.0 searches the assembly with the X73 *petG* CDS (`petG_X73_NZ_CM001580.fasta`, 1581 bp, in `databases/LPS/`).
+Only X73 is used as the reference, so petG-like paralogs are excluded by the identity and length thresholds.
+A hit counts as *petG* when it has at least 95% identity, a genomic span greater than 1570 bp, and covers the X73 gene to within 3 bp of both ends.
+The best such hit is then checked for function from its BLAST alignment, without translating the gene:
 
-### 11. LPS subtype report
+* `nonfunctional`: the net gap length is not a multiple of 3 (frameshift), a substituted codon becomes a stop codon before the X73 stop, or the start codon is lost
+* `uncertain`: the reading frame is restored by compensating frameshifts, or there is an in-frame indel
+* `functional`: none of the above
+* `absent`: no hit passes the thresholds (treated like `nonfunctional` by the phenotype rules)
 
-The pipeline generates a subtype report (`10_Illumina_subtype_report.tsv`) that matches Snippy variants against the [LPS subtype database](databases/LPS/LPS_subtype_database_v2.txt). A variant is reported when it matches the database at the same position, reference allele, and alternate allele in the same reference sequence.
+Hit sequences and the raw BLAST table (with alignment strings) are written to `<sample>/13_petG/`.
+The status and the reason (for example `frameshift: net -1 bp (first -1 bp at ref 988)`) are reported in `10_report/10_Illumina_petG_status.tsv` and the phenotype report.
 
-When phenotype columns are present in the subtype database, the report assigns the corresponding LPS phenotype and its description from `phenotype_lookup.tsv`. The report also includes MLST sequence type and petG presence when those steps are run.
+### 11. LPS subtype and phenotype reports
+
+The subtype report (`10_Illumina_subtype_report.tsv`) lists every Snippy variant that matches the [LPS subtype database](databases/LPS/LPS_subtype_database_v3.txt) at the same reference sequence, position, reference allele and alternate allele.
+
+The phenotype report (`10_Illumina_phenotype_report.tsv`) gives one predicted phenotype per sample.
+It is produced by `bin/lps_phenotype.py`, which is shared with the ONT pipeline, from three inputs:
+
+* `databases/LPS/phenotype_rules.tsv`: the phenotype definitions (the only place phenotypes are defined)
+* `databases/LPS/LPS_subtype_database_v3.txt`: the curated subtypes, with an optional curated `EFFECT` per variant
+* the sample's variants (all Snippy calls in `snps.tab` (including the majority-allele 0/1 calls)), the per-gene read coverage and the petG status
+
+#### Gene states
+
+Each gene named in the rules gets one state, computed from all of the sample's variants inside its CDS (coordinates from the reference GenBank file):
+
+1. `inactivating`: a variant is curated `EFFECT=inactivating`; or snpEff reports `stop_gained` or `start_lost`; or an indel touches the start or stop codon; or the net indel length in the gene is not a multiple of 3 (net frameshift)
+2. `uncertain`: the reading frame is intact but altered (an in-frame indel, or frameshifts that cancel out, such as L1-3 + L1-4 in pcgB, net +9 bp); or snpEff reports `stop_lost`; or less than `--phenotype_min_gene_coverage` (default 90%) of the CDS is covered by reads
+3. `modifying`: a variant is curated `EFFECT=modifying` (an amino acid change known to change the structure; acts only through a `REQUIRES` rule)
+4. `functional`: anything else, including plain substitutions
+
+Variants curated `EFFECT=none` are ignored, which is how an `uncertain` call is resolved as functional once there is evidence.
+
+#### Confidence gate for uncurated calls
+
+Curated variants always count.
+An uncurated variant call that is not confident cannot decide a gene state on its own.
+A call is low-confidence when its allele fraction is below `--phenotype_min_confident_af` (default 0.9).
+Confidence uses the allele fraction from Snippy's rescued 0/1 calls (`snps.rescued.tsv`); calls Snippy keeps as `1/1` are treated as confident.
+If leaving the low-confidence calls out changes the gene state, the gene is `uncertain` and the basis names the call, for example `uncertain: hptE depends on a low-confidence call (1bp ins at 5155: AF=0.63, extends a GGG run)`.
+The gate can only widen a call to `uncertain`; it never makes a call more definite.
+No translation is done, so a stop codon between two compensating frameshifts cannot be seen; this is why such genes are `uncertain` rather than `functional`.
+Per-gene coverage comes from Snippy's `snps.aligned.fa` (positions with depth below `--snippy_mincov` count as not covered); without it a deleted gene would have no variants and would read as functional.
+
+#### Phenotype rules
+
+`phenotype_rules.tsv` has one row per phenotype with the columns `TYPE`, `STEP`, `GENES`, `PETG`, `REQUIRES` and `PHENOTYPE`:
+
+* `STEP` is the position of the gene(s) in biosynthetic order (1 = the residue closest to the inner core); `full` is the row used when no rule gene is inactivated
+* `GENES` lists the interchangeable genes of that step, for example `pcgA,pcgB,pcgC,pcgD`
+* `PETG` is `functional`, `nonfunctional` or `any`; `absent` counts as `nonfunctional`
+* `REQUIRES` is an optional extra condition such as `gctD:modifying`; rows with a condition are checked before rows without
+
+The phenotype is the rule row of the **lowest inactivated step** whose `PETG` matches the sample.
+Uncertain genes (and an uncertain or unassessed petG) are evaluated both ways, and every distinct result is reported, for example `L1_P1 | L1_P3`.
+Types without rules (currently L2 and L4 to L9) get no phenotype.
+Adding a type, a step or a petG split is a change to `phenotype_rules.tsv` only; the rules file is validated at run time (gene names must be CDS in the type's reference, every type needs a `full` row).
+
+#### Phenotype basis
+
+`PHENOTYPE_BASIS` states how much to trust each call:
+
+* `curated`: every variant that changed a gene state is in the subtype database
+* `uncertain: ...`: the call depends on an uncertain gene or petG; the text names the gene, the reason and the phenotype for each alternative
+* `uncurated: ...`: a variant that is not in the subtype database changed a gene state (the variants are listed, and `SUBTYPES` includes `novel`); these are candidates for curation
+* `mixed call: ...` (suffix): a curated variant that changed a gene state has an allele fraction below 0.9 (rescued 0/1 calls with alt fraction < 0.9 (`snps.rescued.tsv`))
+* `no phenotype rules for type`, `untypeable`
 
 ### 12. Genome annotation using Bakta
 
@@ -342,7 +404,7 @@ tar -xvzf db.tar.gz -C /path/to/databases/bakta/
 * `--snippy_mincov`: minimum read depth for a call (default=10, as Snippy)
 * `--snippy_minfrac`: minimum alt fraction for `1/1` calls (default=0, as Snippy)
 * `--snippy_het_min_af`: minimum alt fraction for freebayes `0/1` calls to be kept in `snps.tab`, or `false` to keep Snippy's `1/1`-only filter (default=0.5). See [Majority-allele 0/1 calls](#majority-allele-01-calls).
-* `--reference_LPS_directory`: path to the LPS reference directory containing `reference_LPS.txt`, `LPS_subtype_database_v2.txt`, `petG_X73_NZ_CM001580.fasta`, and FASTA/GB files for all LPS types (default=`databases/LPS`)
+* `--reference_LPS_directory`: path to the LPS reference directory containing `reference_LPS.txt`, `LPS_subtype_database_v3.txt`, `phenotype_rules.tsv`, `petG_X73_NZ_CM001580.fasta`, and FASTA/GB files for all LPS types (default=`databases/LPS`)
 
 ### 9. MLST typing
 
@@ -354,12 +416,20 @@ tar -xvzf db.tar.gz -C /path/to/databases/bakta/
 
 * `--skip_petg`: skip petG detection with BLAST (default=false)
 * `--petg_threads`: number of threads for the BLAST step (default=2)
-* `--petg_min_length`: minimum genomic hit span in bp for petG presence; hits must exceed this value (default=1570)
-* `--petg_min_identity`: minimum percent identity for petG presence (default=95)
+* `--petg_min_length`: minimum genomic hit span in bp for a petG hit; hits must exceed this value (default=1570)
+* `--petg_min_identity`: minimum percent identity for a petG hit (default=95)
 
 ### 11. Report
 
-The subtype report uses `LPS_subtype_database_v2.txt` and, when present, `phenotype_lookup.tsv` from `--reference_LPS_directory`. The pipeline also generates a self-contained HTML summary report from the combined `10_report` outputs when Kaptive and Snippy are enabled.
+The subtype and phenotype reports use `LPS_subtype_database_v3.txt`, `phenotype_rules.tsv` and `phenotype_lookup.tsv` from `--reference_LPS_directory` (see [LPS subtype and phenotype reports](#11-lps-subtype-and-phenotype-reports)).
+
+* `--subtype_database`: subtype database (default="" = `LPS_subtype_database_v3.txt` in `--reference_LPS_directory`)
+* `--phenotype_rules`: phenotype rules file (default="" = `phenotype_rules.tsv` in `--reference_LPS_directory`)
+* `--phenotype_min_gene_coverage`: minimum covered fraction of a rule gene's CDS; below it the gene is `uncertain` (default=0.9)
+* `--phenotype_min_confident_af`: uncurated variant calls below this allele fraction are low-confidence (default=0.9)
+* `--phenotype_homopolymer_min_run`: uncurated indels of a base in a reference run of at least this length are low-confidence (default=0, i.e. off)
+
+The pipeline also generates a self-contained HTML summary report from the combined `10_report` outputs when Kaptive and Snippy are enabled.
 
 * `--skip_html_report`: skip generation of the combined HTML report (default=false)
 
@@ -447,11 +517,20 @@ The `10_report` folder contains combined results across all samples:
   * **POS**: variant position in the reference
   * **REF**: reference allele
   * **ALT**: alternate allele identified in the sample
-  * **GENE**: gene containing the variant
-  * **PREDICTED_PHENOTYPE**: predicted LPS phenotype from the subtype database, when available
-  * **PREDICTED_PHENOTYPE_DESCRIPTION**: description of the predicted phenotype from `phenotype_lookup.tsv`, when available
-  * **PETG_PRESENT**: petG presence (`yes` when present, blank otherwise)
+  * **GENE**: gene containing the variant (curated label from the subtype database)
+  * **EFFECT**: curated effect of the variant (`none`, `modifying`, `inactivating`, or blank = derived by the gene-state rules)
+  * **PETG_STATUS**: petG status (`functional`, `nonfunctional`, `uncertain`, `absent`, or `not assessed`)
   * **NOTE**: subtype database note for the matched variant, when available
+* Phenotype report (`10_Illumina_phenotype_report.tsv`), one row per sample. Column descriptions:
+  * **SAMPLE**, **MLST**, **TYPE**: as in the subtype report
+  * **SUBTYPES**: matched subtypes, separated by `;` (`novel` when an uncurated variant changed a gene state)
+  * **PETG_STATUS**, **PETG_DETAIL**: petG status and the reason or hit location
+  * **LPS_GENE_STATES**: rule genes that are not plainly functional, e.g. `gatG:inactivating;natB:inactivating`
+  * **DETERMINING_GENE**: the inactivated gene of the lowest step (`none` when no rule gene is inactivated)
+  * **PREDICTED_PHENOTYPE**: predicted phenotype; alternatives are separated by ` | ` when the call is uncertain
+  * **PREDICTED_PHENOTYPE_DESCRIPTION**: description(s) from `phenotype_lookup.tsv`
+  * **PHENOTYPE_BASIS**: `curated`, `uncertain: ...`, `uncurated: ...`, `no phenotype rules for type` or `untypeable`, plus an optional `mixed call: ...` suffix
+* petG status per sample (`10_Illumina_petG_status.tsv`)
 * AMRFinderPlus combined results (`12_Illumina_amrfinder.tsv`)
 
 ---

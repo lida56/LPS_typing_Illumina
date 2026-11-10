@@ -6,3 +6,9 @@ L3_P4	LPS ending in Gal I
 L3_P5	LPS ending in Glu II
 L3_P6	LPS ending in Hep
 L3_P7	Fully truncated LPS
+L1_P1	Full LPS with PCho and PEtn
+L1_P2	Full LPS with PCho, lacking PEtn
+L1_P3	LPS ending in Gal I with PEtn, lacking PCho and Gal II
+L1_P4	LPS ending in Gal I, lacking PCho, Gal II and PEtn
+L1_P5	LPS with a single heptose (Hep IV)
+L1_P6	Fully truncated outer core

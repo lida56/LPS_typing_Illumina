@@ -81,9 +81,9 @@ process fastqc {
         publishDir "$params.outdir/$sample/2_fastqc",  mode: 'copy', pattern: '*fastqc.zip'
         publishDir "$params.outdir/$sample/2_fastqc",  mode: 'copy', pattern: '*fastqc.html', saveAs: { filename -> "${sample}_$filename" }
 	input:
-                tuple val(sample), path(reads1), path(reads2), path(reads1_trimmed), path(reads2_trimmed)
+                // Trimmed reads only: with --skip_fastp the raw and trimmed reads are the same files
+                tuple val(sample), path(reads1_trimmed), path(reads2_trimmed)
         output:
-                tuple val(sample), path(reads1), path(reads2), path(reads1_trimmed), path(reads2_trimmed), emit: reads_qc
 		path("fastqc.log")
 		path("*fastqc.zip"), emit: fastqc_zip
                 path("*fastqc.html")
@@ -91,10 +91,16 @@ process fastqc {
         !params.skip_fastqc
         script:
         """
-        fastqc -o \$PWD ${reads1_trimmed} 
-	fastqc -o \$PWD ${reads2_trimmed} 
-        mv R1_trimmed_fastqc.zip ${sample}_R1_trimmed_fastqc.zip
-	mv R2_trimmed_fastqc.zip ${sample}_R2_trimmed_fastqc.zip
+        fastqc -o \$PWD ${reads1_trimmed}
+	fastqc -o \$PWD ${reads2_trimmed}
+	# FastQC names its output after the input file; normalise to <sample>_R{1,2}_trimmed
+	for pair in "1:${reads1_trimmed}" "2:${reads2_trimmed}"; do
+		read_number=\${pair%%:*}
+		base=\$(basename "\${pair#*:}")
+		base=\${base%.gz}; base=\${base%.fastq}; base=\${base%.fq}
+		[[ "\${base}_fastqc.zip" == "${sample}_R\${read_number}_trimmed_fastqc.zip" ]] || mv "\${base}_fastqc.zip" "${sample}_R\${read_number}_trimmed_fastqc.zip"
+		[[ "\${base}_fastqc.html" == "R\${read_number}_trimmed_fastqc.html" ]] || mv "\${base}_fastqc.html" "R\${read_number}_trimmed_fastqc.html"
+	done
 	cp .command.log fastqc.log
         """
 }
@@ -431,7 +437,7 @@ process snippy {
         publishDir "$params.outdir/$sample/8_snippy",  mode: 'copy', pattern: 'snps*', saveAs: { filename -> "${sample}_$filename" }
 	publishDir "$params.outdir/$sample/8_snippy",  mode: 'copy', pattern: '*tab'
 	input:
-                tuple val(sample), path(reads1), path(reads2), path(reads1_trimmed), path(reads2_trimmed), path(kaptive_report)
+                tuple val(sample), path(reads1_trimmed), path(reads2_trimmed), path(kaptive_report)
 	output:
                 tuple val(sample), path("*snps.tab"), path("*snps.high_impact.tab"), path("snps.raw.vcf"), path("snps.filt.vcf"),  path("snps.bam"), path("snps.bam.bai"),  emit: snippy_results
 		path("snippy.log")
@@ -917,9 +923,9 @@ workflow {
 	ch_trimmed = params.skip_fastp
 		? ch_samplesheet_illumina.map { sample, r1, r2 -> tuple(sample, r1, r2, r1, r2) }
 		: fastp.out.trimmed_fastq
-	fastqc(ch_trimmed)
-	summary_fastqc(fastqc.out.fastqc_zip.collect())
 	ch_shovill_reads = ch_trimmed.map { sample, r1, r2, r1t, r2t -> tuple(sample, r1t, r2t) }
+	fastqc(ch_shovill_reads)
+	summary_fastqc(fastqc.out.fastqc_zip.collect())
 	shovill(ch_shovill_reads)
 	summary_shovill(shovill.out.assembly_fasta.collect())
 	quast(shovill.out.assembly_out)
@@ -973,7 +979,7 @@ workflow {
 	}
 	kaptive3(shovill.out.assembly_out)
 	summary_kaptive(kaptive3.out.kaptive_tsv.collect())
-	snippy(ch_trimmed.join(kaptive3.out.kaptive_results))
+	snippy(ch_shovill_reads.join(kaptive3.out.kaptive_results))
 	snippy_tab_ch=snippy.out.snippy_impact_tab.collect()
 	kaptive_summary_ch=summary_kaptive.out.kaptive_summary
 	if (params.mlst_datadir) {
