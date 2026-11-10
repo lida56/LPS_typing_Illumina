@@ -446,6 +446,9 @@ process snippy {
 		path("snps.typing.vcf"), optional: true
 		path("snps.rescued.tsv"), optional: true
 		path("*_snps.snippy.tab"), optional: true
+		// Per-sample inputs for phenotype assignment (gene coverage, mixed 0/1 calls)
+		path("${sample}_snps.aligned.fa"), emit: snippy_coverage
+		path("${sample}_snps.rescued.tsv"), optional: true, emit: snippy_rescued
         when:
         !params.skip_snippy && !params.skip_kaptive3
         script:
@@ -466,6 +469,8 @@ process snippy {
         egrep "^CHROM|frameshift_variant|stop_gained" snps.tab > snps.high_impact.tab
 	mv snps.high_impact.tab ${sample}_snps.high_impact.tab
 	mv snps.tab ${sample}_snps.tab
+	cp snps.aligned.fa ${sample}_snps.aligned.fa
+	if [[ -f snps.rescued.tsv ]]; then cp snps.rescued.tsv ${sample}_snps.rescued.tsv; fi
 	cp .command.log snippy.log
         """
 }
@@ -480,8 +485,7 @@ process petg_blast {
                 tuple val(sample), path(assembly), path(petg_reference)
         output:
                 path("${sample}_petG_hits.fasta"), emit: petg_hits
-                path("${sample}_petG_summary.tsv"), emit: petg_summary
-                path("${sample}_petG_blast.tsv")
+                path("${sample}_petG_blast.tsv"), emit: petg_blast
                 path("${sample}_petG_blast.filtered.tsv")
                 path("petg_blast.log")
         when:
@@ -492,7 +496,7 @@ process petg_blast {
         blastn \\
                 -query ${petg_reference} \\
                 -db assembly_db \\
-                -outfmt "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore" \\
+                -outfmt "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen qseq sseq" \\
                 -num_threads ${params.petg_threads} \\
                 -out ${sample}_petG_blast.tsv
 
@@ -515,16 +519,14 @@ process petg_blast {
         }
         ' ${sample}_petG_blast.tsv > ${sample}_petG_blast.filtered.tsv
 
+        # petG status (functional / nonfunctional / uncertain / absent) is decided in the report
+        # step by lps_phenotype.py from ${sample}_petG_blast.tsv; here only the hit sequences are kept.
         touch ${sample}_petG_hits.fasta
-        echo -e "SAMPLE\\tPETG_PRESENT" > ${sample}_petG_summary.tsv
         if [[ -s ${sample}_petG_blast.filtered.tsv ]]; then
-                while IFS=\$'\\t' read qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore hit_start hit_end strand suffix; do
+                while IFS=\$'\\t' read qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen qseq sseq hit_start hit_end strand suffix; do
                         blastdbcmd -db assembly_db -entry "\$sseqid" -range "\${hit_start}-\${hit_end}" -strand "\$strand" | \\
                         awk -v header=">${sample}|\${sseqid}:\${hit_start}-\${hit_end}\${suffix}" 'BEGIN { print header } /^>/ { next } { print }' >> ${sample}_petG_hits.fasta
                 done < ${sample}_petG_blast.filtered.tsv
-                echo -e "${sample}\\tyes" >> ${sample}_petG_summary.tsv
-        else
-                echo -e "${sample}\\t" >> ${sample}_petG_summary.tsv
         fi
 
         cp .command.log petg_blast.log
@@ -550,192 +552,47 @@ process empty_petg_report_input {
 }
 
 process report {
-	publishDir "$params.outdir/10_report",  mode: 'copy', pattern: '*tsv'	
+	publishDir "$params.outdir/10_report",  mode: 'copy', pattern: '*tsv'
 	input:
 		path(snippy_files)
 		path(kaptive_summary)
-		path(petg_summaries)
+		path(petg_files)
 		path(mlst_files)
+		path(coverage_files)
+		path(rescued_files)
 	output:
-		tuple path("8_Illumina_snippy_snps.tsv"), path("8_Illumina_snippy_snps.high_impact.tsv"), path("10_Illumina_subtype_report.tsv"), emit: subtype_report	
+		tuple path("8_Illumina_snippy_snps.tsv"), path("8_Illumina_snippy_snps.high_impact.tsv"), path("10_Illumina_subtype_report.tsv"), path("10_Illumina_phenotype_report.tsv"), path("10_Illumina_petG_status.tsv"), emit: subtype_report
 	when:
 	!params.skip_snippy && !params.skip_kaptive3
 	script:
+	def subtype_db = params.subtype_database ?: "${params.reference_LPS_directory}/LPS_subtype_database_v3.txt"
+	def phenotype_rules = params.phenotype_rules ?: "${params.reference_LPS_directory}/phenotype_rules.tsv"
+	def petg_args = params.skip_petg ? "--petg-skipped" : "--petg-blast *_petG_blast.tsv --petg-min-identity ${params.petg_min_identity} --petg-min-length ${params.petg_min_length}"
 	"""
 	echo -e sampleID\\\tCHROM\\\tPOS\\\tTYPE\\\tREF\\\tALT\\\tEVIDENCE\\\tFTYPE\\\tSTRAND\\\tNT_POS\\\tAA_POS\\\tEFFECT\\\tLOCUS_TAG\\\tGENE\\\tPRODUCT > header_snippy
+	touch 8_snippy_snps.high_impact.tsv.tmp 8_snippy_snps.tsv.tmp
 	for file in `ls *_snps.high_impact.tab`; do fileName=\$(basename \$file); sample=\${fileName%%_snps.high_impact.tab}; grep -v EVIDENCE \$file | sed s/^/\${sample}\\\t/  >> 8_snippy_snps.high_impact.tsv.tmp; done
 	cat header_snippy 8_snippy_snps.high_impact.tsv.tmp > 8_Illumina_snippy_snps.high_impact.tsv
 	for file in `ls *_snps.tab`; do fileName=\$(basename \$file); sample=\${fileName%%_snps.tab}; grep -v EVIDENCE \$file | sed s/^/\${sample}\\\t/  >> 8_snippy_snps.tsv.tmp; done
 	cat header_snippy 8_snippy_snps.tsv.tmp > 8_Illumina_snippy_snps.tsv
 
-	echo -e "SAMPLE\\tPETG_PRESENT" > petg_lookup.tsv
-	find . -maxdepth 1 -name '*_petG_summary.tsv' | sort | while read petg_file; do
-		tail -n +2 "\$petg_file" >> petg_lookup.tsv
-	done
-
-	echo -e "SAMPLE\\tMLST" > mlst_lookup.tsv
-	find . -maxdepth 1 -name '*_mlst.csv' | sort | while read mlst_file; do
-		fileName=\$(basename "\$mlst_file")
-		sample=\${fileName%%_mlst.csv}
-		mlst_st=\$(awk -F',' 'NR == 1 {print \$3; exit}' "\$mlst_file")
-		echo -e "\${sample}\\t\${mlst_st}" >> mlst_lookup.tsv
-	done
-
-	awk -F'\t' -v OFS='\t' '
-	NR == 1 {
-		for (i = 1; i <= NF; i++) {
-			header[\$i] = i
-		}
-		sample_col = ("sampleID" in header) ? header["sampleID"] : 1
-		locus_col = ("Best match locus" in header) ? header["Best match locus"] : 2
-		confidence_col = ("Match confidence" in header) ? header["Match confidence"] : 4
-		next
-	}
-	{
-		if (\$confidence_col == "Typeable") {
-			split(\$locus_col, a, "-")
-			gsub("LPS", "L", a[1])
-			print \$sample_col, a[1]
-		} else {
-			print \$sample_col, "untypeable"
-		}
-	}' "${kaptive_summary}" > kaptive_tmp
-
-	subtype_db="${params.reference_LPS_directory}/LPS_subtype_database_v2.txt"
-	phenotype_lookup="${params.reference_LPS_directory}/phenotype_lookup.tsv"
-	if [[ -f "\$phenotype_lookup" ]]; then
-		phenotype_lookup_input="\$phenotype_lookup"
-	else
-		touch phenotype_lookup_empty.tsv
-		phenotype_lookup_input="phenotype_lookup_empty.tsv"
-	fi
-
-	awk -F '\\t' -v OFS='\\t' -v subtype_db="\$subtype_db" -v phenotype_lookup="\$phenotype_lookup_input" -v petg_lookup="petg_lookup.tsv" -v mlst_lookup="mlst_lookup.tsv" '
-	function set_header_fields(    i) {
-		for (i = 1; i <= NF; i++) {
-			header[\$i] = i
-		}
-		db_type_col = ("TYPE" in header) ? header["TYPE"] : 1
-		db_subtype_col = ("SUBTYPE" in header) ? header["SUBTYPE"] : 2
-		db_isolate_col = ("ISOLATE" in header) ? header["ISOLATE"] : 3
-		db_chrom_col = ("CHROM" in header) ? header["CHROM"] : 4
-		db_pos_col = ("POS" in header) ? header["POS"] : 5
-		db_vartype_col = ("VARTYPE" in header) ? header["VARTYPE"] : 6
-		db_ref_col = ("REF" in header) ? header["REF"] : 7
-		db_alt_col = ("ALT" in header) ? header["ALT"] : 8
-		db_gene_col = ("GENE" in header) ? header["GENE"] : 9
-		db_pheno_default_col = ("PHENOTYPE_DEFAULT" in header) ? header["PHENOTYPE_DEFAULT"] : 0
-		db_pheno_multi_col = ("PHENOTYPE_MULTIPLE_SUBTYPES" in header) ? header["PHENOTYPE_MULTIPLE_SUBTYPES"] : 0
-		db_note_col = ("NOTE" in header) ? header["NOTE"] : 10
-	}
-	function field_value(col) {
-		return (col > 0 && col <= NF) ? \$col : ""
-	}
-	function clean_phenotype(value) {
-		return (value == "NA") ? "" : value
-	}
-	function phenotype_from_rule(type, rule, parts) {
-		if (rule == "" || rule == "NA") {
-			return ""
-		}
-		split(rule, parts, "_")
-		return (parts[2] == "") ? rule : type "_" parts[2]
-	}
-	function choose_phenotype(sample, type, default_phenotype, multi_phenotypes, rules, i, parts) {
-		default_phenotype = clean_phenotype(default_phenotype)
-		if (multi_phenotypes != "" && multi_phenotypes != "NA") {
-			rule_count = split(multi_phenotypes, rules, ";")
-			for (i = 1; i <= rule_count; i++) {
-				split(rules[i], parts, "_")
-				if (parts[1] != "" && ((sample SUBSEP parts[1]) in sample_subtype)) {
-					return phenotype_from_rule(type, rules[i])
-				}
-			}
-		}
-		return default_phenotype
-	}
-	FILENAME == subtype_db {
-		if (FNR == 1) {
-			set_header_fields()
-			next
-		}
-		key = field_value(db_chrom_col) OFS field_value(db_pos_col) OFS field_value(db_ref_col) OFS field_value(db_alt_col)
-		db_count[key]++
-		idx = key SUBSEP db_count[key]
-		db_type[idx] = field_value(db_type_col)
-		db_subtype[idx] = field_value(db_subtype_col)
-		db_isolate[idx] = field_value(db_isolate_col)
-		db_chrom[idx] = field_value(db_chrom_col)
-		db_pos[idx] = field_value(db_pos_col)
-		db_vartype[idx] = field_value(db_vartype_col)
-		db_ref[idx] = field_value(db_ref_col)
-		db_alt[idx] = field_value(db_alt_col)
-		db_gene[idx] = field_value(db_gene_col)
-		db_pheno_default[idx] = field_value(db_pheno_default_col)
-		db_pheno_multi[idx] = field_value(db_pheno_multi_col)
-		db_note[idx] = field_value(db_note_col)
-		next
-	}
-	FILENAME == phenotype_lookup {
-		if (FNR > 1 && \$1 != "") {
-			phenotype_description[\$1] = \$2
-		}
-		next
-	}
-	FILENAME == petg_lookup {
-		if (FNR > 1 && \$1 != "") {
-			petg_present[\$1] = \$2
-		}
-		next
-	}
-	FILENAME == mlst_lookup {
-		if (FNR > 1 && \$1 != "") {
-			mlst_st[\$1] = \$2
-		}
-		next
-	}
-	FNR > 1 {
-		sample = \$1
-		key = \$2 OFS \$3 OFS \$5 OFS \$6
-		for (i = 1; i <= db_count[key]; i++) {
-			idx = key SUBSEP i
-			row_count++
-			row_sample[row_count] = sample
-			row_idx[row_count] = idx
-			sample_subtype[sample SUBSEP db_subtype[idx]] = 1
-		}
-	}
-	END {
-		print "SAMPLE", "MLST", "TYPE", "SUBTYPE", "VARTYPE", "ISOLATE_DATABASE", "CHROM", "POS", "REF", "ALT", "GENE", "PREDICTED_PHENOTYPE", "PREDICTED_PHENOTYPE_DESCRIPTION", "PETG_PRESENT", "NOTE"
-		for (i = 1; i <= row_count; i++) {
-			sample = row_sample[i]
-			idx = row_idx[i]
-			phenotype = choose_phenotype(sample, db_type[idx], db_pheno_default[idx], db_pheno_multi[idx])
-			description = (phenotype in phenotype_description) ? phenotype_description[phenotype] : ""
-			print sample, mlst_st[sample], db_type[idx], db_subtype[idx], db_vartype[idx], db_isolate[idx], db_chrom[idx], db_pos[idx], db_ref[idx], db_alt[idx], db_gene[idx], phenotype, description, petg_present[sample], db_note[idx]
-		}
-	}
-	' "\$subtype_db" "\$phenotype_lookup_input" petg_lookup.tsv mlst_lookup.tsv 8_Illumina_snippy_snps.tsv > 10_Illumina_subtype_report.tsv.tmp
-	awk -F'\t' 'NR > 1 {print \$1}' 10_Illumina_subtype_report.tsv.tmp | sort | uniq > list_samples_snippy_exclude
-	awk -F'\t' 'FILENAME == ARGV[1] {exclude[\$1] = 1; next} !(\$1 in exclude)' list_samples_snippy_exclude kaptive_tmp > kaptive_to_keep
-	awk -F'\t' -v OFS='\t' '
-	FILENAME == "mlst_lookup.tsv" {
-		if (FNR > 1 && \$1 != "") {
-			mlst_st[\$1] = \$2
-		}
-		next
-	}
-	FILENAME == "petg_lookup.tsv" {
-		if (FNR > 1 && \$1 != "") {
-			petg_present[\$1] = \$2
-		}
-		next
-	}
-	{
-		print \$1, mlst_st[\$1], \$2, "NA", "NA", "NA", "NA", "NA", "NA", "NA", "NA", "", "", petg_present[\$1], ""
-	}
-	' mlst_lookup.tsv petg_lookup.tsv kaptive_to_keep > kaptive_to_keep.tsv
-	cat 10_Illumina_subtype_report.tsv.tmp kaptive_to_keep.tsv > 10_Illumina_subtype_report.tsv
+	# Subtype matching, gene states, petG status and phenotype (shared with the ONT pipeline)
+	lps_phenotype.py \\
+		--lps-db-dir ${params.reference_LPS_directory} \\
+		--subtype-db ${subtype_db} \\
+		--rules ${phenotype_rules} \\
+		--phenotype-lookup ${params.reference_LPS_directory}/phenotype_lookup.tsv \\
+		--kaptive ${kaptive_summary} \\
+		--mlst \$(ls *_mlst.csv 2>/dev/null) \\
+		--snippy-table 8_Illumina_snippy_snps.tsv \\
+		--rescued \$(ls *_snps.rescued.tsv 2>/dev/null) \\
+		--coverage *_snps.aligned.fa \\
+		--coverage-suffix _snps.aligned.fa \\
+		--min-coverage ${params.phenotype_min_gene_coverage} \\
+		--min-confident-af ${params.phenotype_min_confident_af} \\
+		--homopolymer-min-run ${params.phenotype_homopolymer_min_run} \\
+		${petg_args} \\
+		--prefix 10_Illumina
 	"""
 }
 
@@ -999,12 +856,14 @@ workflow {
 	if (!params.skip_petg && !params.skip_kaptive3) {
 		ch_petg_reference = Channel.fromPath("${params.reference_LPS_directory}/petG_X73_NZ_CM001580.fasta", checkIfExists: true)
 		petg_blast(shovill.out.assembly_out.combine(ch_petg_reference))
-		petg_report_ch = petg_blast.out.petg_summary.collect()
+		petg_report_ch = petg_blast.out.petg_blast.collect()
 	} else {
 		empty_petg_report_input()
 		petg_report_ch = empty_petg_report_input.out.empty_petg
 	}
-	report(snippy_tab_ch,kaptive_summary_ch,petg_report_ch,mlst_report_ch)
+	snippy_coverage_ch = snippy.out.snippy_coverage.collect().ifEmpty([])
+	snippy_rescued_ch = snippy.out.snippy_rescued.collect().ifEmpty([])
+	report(snippy_tab_ch,kaptive_summary_ch,petg_report_ch,mlst_report_ch,snippy_coverage_ch,snippy_rescued_ch)
 	if (!params.skip_bakta) {
 		if (params.download_bakta_db) {
 			download_bakta_db()
@@ -1050,6 +909,6 @@ workflow {
 	if (params.skip_petg) skipped_list << 'petG'
 	if (params.skip_amrfinder) skipped_list << 'amrfinder'
 	if (params.skip_bakta) skipped_list << 'bakta'
-	param_note_str = "MLST scheme: ${params.mlst_scheme}; petG reported present when a hit spans > ${params.petg_min_length} bp at >= ${params.petg_min_identity}% identity"
+	param_note_str = "MLST scheme: ${params.mlst_scheme}; petG assessed when an X73-like hit covers the whole gene (> ${params.petg_min_length} bp at >= ${params.petg_min_identity}% identity); LPS genes below ${params.phenotype_min_gene_coverage * 100}% coverage are called uncertain"
 	html_report(html_inputs_ch.collect(), workflow.manifest.version, skipped_list.join(', '), param_note_str)
 }
