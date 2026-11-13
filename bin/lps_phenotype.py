@@ -17,6 +17,13 @@ Overview
 4. The phenotype is the rule row of the lowest inactivated biosynthetic step that
    matches the petG state (``phenotype_rules.tsv``). Uncertain genes or an
    uncertain petG produce every distinct alternative phenotype.
+5. Each sample gets a SUBTYPE_STATUS: ``assigned`` (matched a subtype in the database),
+   ``reference_identical`` (no variants in the whole, fully covered locus),
+   ``uncurated_variants`` (variants, none in the database), ``not_assessed`` (variant
+   calling failed or left gaps) or ``not_applicable`` (untypeable). Types with
+   ``CURATED_ONLY = yes`` in the rules (L3) give a phenotype only when a database
+   subtype supports it; otherwise, like untypeable samples and types without rules,
+   the phenotype is "Not predicted" and an unmatched subtype is "Not assigned".
 
 Outputs
 -------
@@ -41,6 +48,17 @@ STOP_CODONS = {"TAA", "TAG", "TGA"}
 START_CODONS = {"ATG", "GTG", "TTG"}
 NA_VALUES = {"", "NA", "na", "N/A", ".", "-"}
 DEFAULT_MIN_COVERAGE = 0.90
+DEFAULT_MIN_DEPTH = 10
+
+# Values written to the reports in place of a blank or NA.
+NOT_ASSIGNED = "Not assigned"
+NOT_PREDICTED = "Not predicted"
+# SUBTYPE_STATUS values: how far the subtype assignment could be taken.
+STATUS_ASSIGNED = "assigned"                    # matched a subtype in the database
+STATUS_REFERENCE = "reference_identical"        # no variants in the whole locus, which is covered
+STATUS_UNCURATED = "uncurated_variants"         # variants in the locus, none of them in the database
+STATUS_NOT_ASSESSED = "not_assessed"            # variant calling failed, was skipped or left gaps
+STATUS_NOT_APPLICABLE = "not_applicable"        # untypeable, or no reference for the type
 # Allele fraction below which a call is reported as mixed (same cut-off as the
 # Illumina snippy_typing_calls.sh "heterogeneous" flag).
 MIXED_AF = 0.90
@@ -172,6 +190,8 @@ class RuleSet:
     def __init__(self, lps_type):
         self.type = lps_type
         self.rules = []
+        # True: a phenotype is only given when a subtype in the database supports it
+        self.curated_only = False
 
     @property
     def step_genes(self):
@@ -223,11 +243,17 @@ def load_rules(path, references=None):
     rulesets = OrderedDict()
     errors = []
     seen = set()
+    curated_values = {}
     for line_no, row in enumerate(read_tsv(path), start=2):
         lps_type = clean(row.get("TYPE"))
         step_value = clean(row.get("STEP"))
         petg = clean(row.get("PETG")) or "any"
         phenotype = clean(row.get("PHENOTYPE"))
+        curated_only = clean(row.get("CURATED_ONLY")).lower() or "no"
+        if curated_only not in ("yes", "no"):
+            errors.append(f"{path}:{line_no}: CURATED_ONLY must be yes or no, got '{curated_only}'")
+            curated_only = "no"
+        curated_values.setdefault(lps_type, set()).add(curated_only)
         genes = [g.strip() for g in clean(row.get("GENES")).split(",") if g.strip()]
         where = f"{path}:{line_no}"
         if not lps_type or not phenotype:
@@ -260,6 +286,10 @@ def load_rules(path, references=None):
         ruleset.rules.append(Rule(lps_type, step, genes, petg, requires, phenotype))
 
     for lps_type, ruleset in rulesets.items():
+        values = curated_values.get(lps_type, {"no"})
+        if len(values) > 1:
+            errors.append(f"{lps_type}: CURATED_ONLY must be the same on every row of a type")
+        ruleset.curated_only = values == {"yes"}
         steps = {}
         for rule in ruleset.rules:
             if rule.step is not None:
@@ -307,9 +337,22 @@ class DbVariant:
     def matchable(self):
         return all(self.key)
 
+    @property
+    def is_reference(self):
+        """The subtype that is the type's reference sequence (VARTYPE = reference)."""
+        return self.vartype.lower() == "reference"
+
 
 def load_subtype_db(path):
     entries = [DbVariant(row) for row in read_tsv(path)]
+    reference_rows = {}
+    for entry in entries:
+        if entry.is_reference:
+            reference_rows.setdefault(entry.type, []).append(entry.subtype)
+    duplicated = sorted(t for t, names in reference_rows.items() if len(names) > 1)
+    if duplicated:
+        raise ValueError("More than one reference subtype (VARTYPE = reference) for type "
+                         + ", ".join(duplicated))
     bad = [e.subtype for e in entries if e.effect not in EFFECT_VALUES]
     if bad:
         raise ValueError(
@@ -561,40 +604,26 @@ def read_rescued(paths):
 # Coverage
 # --------------------------------------------------------------------------- #
 
-def read_coverage(path, min_depth=1):
+def read_coverage(path, min_depth=DEFAULT_MIN_DEPTH):
     """Return {chrom: set(covered 1-based positions)} or None if unavailable.
 
-    Accepts a snippy ``snps.aligned.fa`` (``-`` = no coverage, ``N`` = below
-    --mincov) or a ``samtools depth -a`` table (chrom, pos, depth).
+    The input is a ``samtools depth -a`` table (chrom, pos, depth) over the LPS reference,
+    made the same way in both pipelines. A position is covered at depth >= min_depth.
     """
     path = Path(path)
     if not path.is_file() or path.stat().st_size == 0:
         return None
     covered = {}
     with path.open() as handle:
-        first = handle.readline()
-        handle.seek(0)
-        if first.startswith(">"):
-            name, chunks = None, []
-            for line in itertools.chain(handle, [">"]):
-                line = line.strip()
-                if line.startswith(">"):
-                    if name is not None:
-                        sequence = "".join(chunks)
-                        covered[name] = {i + 1 for i, base in enumerate(sequence) if base not in "-Nn"}
-                    name, chunks = (line[1:].split()[0] if len(line) > 1 else None), []
-                else:
-                    chunks.append(line)
-        else:
-            for line in handle:
-                fields = line.split("\t")
-                if len(fields) < 3:
-                    continue
-                try:
-                    if int(fields[2]) >= min_depth:
-                        covered.setdefault(fields[0], set()).add(int(fields[1]))
-                except ValueError:
-                    continue
+        for line in handle:
+            fields = line.split("\t")
+            if len(fields) < 3:
+                continue
+            try:
+                if int(fields[2]) >= min_depth:
+                    covered.setdefault(fields[0], set()).add(int(fields[1]))
+            except ValueError:
+                continue
     return covered
 
 
@@ -604,6 +633,16 @@ def gene_coverage(covered, chrom, gene):
         return 0.0
     hits = sum(1 for p in range(gene.start, gene.end + 1) if p in positions)
     return hits / gene.length
+
+
+def locus_gaps(covered, reference, min_coverage):
+    """CDS of the whole reference locus with less than min_coverage covered: [(name, fraction)]."""
+    gaps = []
+    for gene in reference.genes.values():
+        fraction = gene_coverage(covered, reference.record, gene)
+        if fraction < min_coverage:
+            gaps.append((gene.name, fraction))
+    return gaps
 
 
 # --------------------------------------------------------------------------- #
@@ -896,27 +935,55 @@ def read_mlst(paths):
 # --------------------------------------------------------------------------- #
 
 PHENOTYPE_COLUMNS = [
-    "SAMPLE", "MLST", "TYPE", "SUBTYPES", "PETG_STATUS", "PETG_DETAIL", "LPS_GENE_STATES",
+    "SAMPLE", "MLST", "TYPE", "SUBTYPES", "SUBTYPE_STATUS", "PETG_STATUS", "PETG_DETAIL", "LPS_GENE_STATES",
     "DETERMINING_GENE", "PREDICTED_PHENOTYPE", "PREDICTED_PHENOTYPE_DESCRIPTION", "PHENOTYPE_BASIS",
 ]
 SUBTYPE_COLUMNS = [
-    "SAMPLE", "MLST", "TYPE", "SUBTYPE", "VARTYPE", "ISOLATE_DATABASE", "CHROM", "POS", "REF", "ALT",
-    "GENE", "EFFECT", "PETG_STATUS", "NOTE",
+    "SAMPLE", "MLST", "TYPE", "SUBTYPE", "SUBTYPE_STATUS", "VARTYPE", "ISOLATE_DATABASE", "CHROM", "POS", "REF",
+    "ALT", "GENE", "EFFECT", "PETG_STATUS", "NOTE",
 ]
 PETG_COLUMNS = ["SAMPLE", "PETG_STATUS", "PETG_DETAIL"]
 
+# Longest list of uncurated variants written into the phenotype basis
+MAX_LISTED_VARIANTS = 8
 
-def phenotype_for_sample(sample, lps_type, ruleset, reference, variants, petg_status, coverage,
-                         min_coverage):
-    """Return a dict of phenotype report fields for one sample."""
-    result = {"LPS_GENE_STATES": "", "DETERMINING_GENE": "", "PREDICTED_PHENOTYPE": "", "PHENOTYPE_BASIS": ""}
+
+def subtype_status(lps_type, reference, variants, coverage, min_coverage, called=True):
+    """Return (SUBTYPE_STATUS, detail) for one sample.
+
+    ``called`` is False when the sample has no variant calling output at all, which must not be
+    confused with a sample that was called and has no variants. ``coverage`` is the sample's
+    {chrom: covered positions} map, or None if there is no coverage data.
+    """
     if lps_type == "untypeable" or not lps_type:
-        result["PHENOTYPE_BASIS"] = "untypeable"
-        return result, []
-    if ruleset is None or reference is None:
-        result["PHENOTYPE_BASIS"] = "no phenotype rules for type"
-        return result, []
+        return STATUS_NOT_APPLICABLE, "untypeable"
+    if reference is None:
+        return STATUS_NOT_APPLICABLE, "no reference for the type"
+    if not called:
+        return STATUS_NOT_ASSESSED, "no variant calling output for this sample"
+    on_reference = [v for v in variants if v.chrom == reference.record]
+    if any(v.db for v in on_reference):
+        return STATUS_ASSIGNED, ""
+    if on_reference:
+        return STATUS_UNCURATED, f"{len(on_reference)} variant(s) in the locus, none in the subtype database"
+    # No variants at all: this only means "identical to the reference" if the whole locus was read.
+    if coverage is None:
+        return STATUS_NOT_ASSESSED, "no variants, but there is no coverage data to show the locus was read"
+    gaps = locus_gaps(coverage, reference, min_coverage)
+    if gaps:
+        shown = ", ".join(f"{name} {fraction:.0%}" for name, fraction in gaps[:MAX_LISTED_VARIANTS])
+        more = f" (+{len(gaps) - MAX_LISTED_VARIANTS} more)" if len(gaps) > MAX_LISTED_VARIANTS else ""
+        return STATUS_NOT_ASSESSED, f"no variants, but the locus is not fully covered: {shown}{more}"
+    return STATUS_REFERENCE, ""
 
+
+def describe_variant(variant, reference):
+    genes = [g.name for g in reference.genes.values() if variant.overlaps(g.start, g.end)]
+    return f"{variant.label()} ({'/'.join(genes) if genes else 'intergenic'})"
+
+
+def classify_rule_genes(ruleset, reference, variants, coverage, min_coverage):
+    """Gene state of every rule gene from the variants that overlap it."""
     on_reference = [v for v in variants if v.chrom == reference.record]
     gene_calls = OrderedDict()
     for name in ruleset.genes:
@@ -924,17 +991,53 @@ def phenotype_for_sample(sample, lps_type, ruleset, reference, variants, petg_st
         overlapping = [v for v in on_reference if v.overlaps(gene.start, gene.end)]
         fraction = gene_coverage(coverage, reference.record, gene) if coverage is not None else None
         gene_calls[name] = classify_gene(gene, overlapping, fraction, min_coverage)
+    return gene_calls
 
+
+def phenotype_for_sample(sample, lps_type, ruleset, reference, variants, petg_status, coverage,
+                         min_coverage, called=True):
+    """Return (dict of phenotype report fields, uncurated gene calls) for one sample."""
+    status, detail = subtype_status(lps_type, reference, variants, coverage, min_coverage, called)
+    result = {"SUBTYPE_STATUS": status, "LPS_GENE_STATES": "", "DETERMINING_GENE": "",
+              "PREDICTED_PHENOTYPE": NOT_PREDICTED, "PHENOTYPE_BASIS": ""}
+    if lps_type == "untypeable" or not lps_type:
+        result["PHENOTYPE_BASIS"] = "untypeable"
+        return result, []
+    if status == STATUS_NOT_ASSESSED:
+        result["PHENOTYPE_BASIS"] = f"not assessed: {detail}"
+        return result, []
+    if ruleset is None or reference is None:
+        result["PHENOTYPE_BASIS"] = "no phenotype rules for type"
+        return result, []
+
+    gene_calls = classify_rule_genes(ruleset, reference, variants, coverage, min_coverage)
     outcomes = predict(ruleset, gene_calls, petg_status)
     phenotypes = [p for p in outcomes if p]
-    result["PREDICTED_PHENOTYPE"] = " | ".join(phenotypes)
 
-    determining = []
-    for phenotype in phenotypes:
-        for _, _, gene in outcomes[phenotype]:
-            if gene and gene not in determining:
-                determining.append(gene)
-    result["DETERMINING_GENE"] = ";".join(determining) if determining else ("none" if phenotypes else "")
+    # Some types (L3) give a phenotype only when a subtype in the database supports it:
+    # structures there are not explained by inactivating mutations alone.
+    withheld = ""
+    if ruleset.curated_only and phenotypes:
+        if status == STATUS_UNCURATED:
+            withheld = "no subtype in the database matches this isolate"
+        elif status == STATUS_ASSIGNED:
+            curated_calls = classify_rule_genes(
+                ruleset, reference, [v for v in variants if v.db], coverage, min_coverage)
+            curated = {p for p in predict(ruleset, curated_calls, petg_status) if p}
+            if curated != set(phenotypes):
+                withheld = "an uncurated variant changes the phenotype"
+
+    if withheld:
+        result["PREDICTED_PHENOTYPE"] = NOT_PREDICTED
+        result["DETERMINING_GENE"] = ""
+    else:
+        result["PREDICTED_PHENOTYPE"] = " | ".join(phenotypes) if phenotypes else NOT_PREDICTED
+        determining = []
+        for phenotype in phenotypes:
+            for _, _, gene in outcomes[phenotype]:
+                if gene and gene not in determining:
+                    determining.append(gene)
+        result["DETERMINING_GENE"] = ";".join(determining) if determining else ("none" if phenotypes else "")
     # Only genes that are not plainly functional; substitution-only genes are left out.
     result["LPS_GENE_STATES"] = ";".join(
         call.describe() for call in gene_calls.values() if call.state != "functional")
@@ -967,13 +1070,27 @@ def phenotype_for_sample(sample, lps_type, ruleset, reference, variants, petg_st
             notes.append(f"uncurated: {call.gene} (not in subtype DB: {', '.join(novel)})")
         else:
             notes.append(f"uncurated: {call.gene} {call.state} by {call.reason} (not in subtype DB: {', '.join(novel)})")
+    if status == STATUS_UNCURATED:
+        # List the other uncurated variants too, so the isolate can be curated
+        explained = {id(v) for c in uncurated_calls for v in c.variants if not v.db}
+        others = [v for v in variants
+                  if v.chrom == reference.record and not v.db and id(v) not in explained]
+        if others:
+            shown = ", ".join(describe_variant(v, reference) for v in others[:MAX_LISTED_VARIANTS])
+            more = f" (+{len(others) - MAX_LISTED_VARIANTS} more)" if len(others) > MAX_LISTED_VARIANTS else ""
+            notes.append(f"uncurated variants: {shown}{more}")
     if not notes:
-        notes.append("curated")
+        notes.append("no variants in the locus (identical to the reference)" if status == STATUS_REFERENCE
+                     else "curated")
     mixed = [v for c in gene_calls.values() if c.state != "functional" for v in c.mixed]
     if mixed:
         notes.append("mixed call: " + ", ".join(
             f"{v.label()}" + (f" AF={format_af(v.af)}" if v.af is not None else "") for v in mixed))
-    if not phenotypes:
+    if coverage is None:
+        notes.append("gene coverage not assessed")
+    if withheld:
+        notes.insert(0, f"not predicted: {withheld}; the rules alone would give {' | '.join(phenotypes)}")
+    elif not phenotypes:
         notes.insert(0, "no matching phenotype rule")
     result["PHENOTYPE_BASIS"] = "; ".join(notes)
     return result, uncurated_calls
@@ -983,6 +1100,7 @@ def build_reports(args):
     references = load_references(args.lps_db_dir)
     rulesets = load_rules(args.rules, references)
     db_entries, db_index = load_subtype_db(args.subtype_db)
+    reference_subtypes = {e.type: e for e in db_entries if e.is_reference}
     lookup = {clean(r.get("PREDICTED_PHENOTYPE")): clean(r.get("PREDICTED_PHENOTYPE_DESCRIPTION"))
               for r in read_tsv(args.phenotype_lookup)} if args.phenotype_lookup else {}
 
@@ -1011,6 +1129,12 @@ def build_reports(args):
     by_sample = OrderedDict()
     for variant in variants:
         by_sample.setdefault(variant.sample, []).append(variant)
+
+    # Samples whose variant calling produced output; a sample without it was not assessed,
+    # which is different from a sample that was called and has no variants.
+    called_samples = None
+    if args.called is not None:
+        called_samples = {Path(path).name.split(args.called_suffix)[0] for path in args.called}
 
     petg = {}
     if args.petg_skipped:
@@ -1044,22 +1168,29 @@ def build_reports(args):
             coverage = read_coverage(coverage_paths[sample], args.min_depth)
         ruleset = rulesets.get(lps_type)
         reference = references.get(lps_type)
+        called = called_samples is None or sample in called_samples
         fields, uncurated_calls = phenotype_for_sample(
-            sample, lps_type, ruleset, reference, sample_variants, petg_status, coverage, args.min_coverage)
-        if coverage is None and ruleset is not None and args.coverage is not None:
-            fields["PHENOTYPE_BASIS"] += "; gene coverage not assessed"
+            sample, lps_type, ruleset, reference, sample_variants, petg_status, coverage, args.min_coverage,
+            called)
+        status = fields["SUBTYPE_STATUS"]
 
-        matched = [(v, e) for v in sample_variants for e in v.db]
-        subtypes = []
-        for _, entry in matched:
-            if entry.subtype not in subtypes:
-                subtypes.append(entry.subtype)
-        if uncurated_calls:
-            subtypes.append("novel")
-        if not subtypes and ruleset is not None and reference is not None:
-            # Reference-like subtypes (no variant) are not matchable; report none.
+        matched = [(v, e) for v in sample_variants for e in v.db] if status == STATUS_ASSIGNED else []
+        reference_entry = reference_subtypes.get(lps_type)
+        if status == STATUS_ASSIGNED:
             subtypes = []
-        descriptions = [lookup.get(p.strip(), "") for p in fields["PREDICTED_PHENOTYPE"].split("|") if p.strip()]
+            for _, entry in matched:
+                if entry.subtype not in subtypes:
+                    subtypes.append(entry.subtype)
+            if uncurated_calls:
+                subtypes.append("novel")
+        elif status == STATUS_REFERENCE:
+            subtypes = [reference_entry.subtype if reference_entry else "reference"]
+        else:
+            subtypes = [NOT_ASSIGNED]
+        if fields["PREDICTED_PHENOTYPE"] == NOT_PREDICTED:
+            descriptions = [NOT_PREDICTED]
+        else:
+            descriptions = [lookup.get(p.strip(), "") for p in fields["PREDICTED_PHENOTYPE"].split("|") if p.strip()]
         phenotype_rows.append({
             "SAMPLE": sample,
             "MLST": mlst.get(sample, ""),
@@ -1076,16 +1207,24 @@ def build_reports(args):
                 subtype_rows.append({
                     "SAMPLE": sample, "MLST": mlst.get(sample, ""),
                     "TYPE": lps_type if lps_type not in ("", "untypeable") else entry.type,
-                    "SUBTYPE": entry.subtype, "VARTYPE": entry.vartype, "ISOLATE_DATABASE": entry.isolate,
+                    "SUBTYPE": entry.subtype, "SUBTYPE_STATUS": status,
+                    "VARTYPE": entry.vartype, "ISOLATE_DATABASE": entry.isolate,
                     "CHROM": entry.chrom, "POS": entry.pos, "REF": entry.ref, "ALT": entry.alt,
                     "GENE": entry.gene, "EFFECT": entry.effect, "PETG_STATUS": petg_status, "NOTE": entry.note,
                 })
         else:
-            subtype_rows.append({
+            # One row per sample without a variant-level subtype match. The reference subtype
+            # has no variants, so its VARTYPE reads "reference".
+            row = {
                 "SAMPLE": sample, "MLST": mlst.get(sample, ""), "TYPE": lps_type or "untypeable",
-                "SUBTYPE": "NA", "VARTYPE": "NA", "ISOLATE_DATABASE": "NA", "CHROM": "NA", "POS": "NA",
-                "REF": "NA", "ALT": "NA", "GENE": "NA", "EFFECT": "", "PETG_STATUS": petg_status, "NOTE": "",
-            })
+                "SUBTYPE": subtypes[0], "SUBTYPE_STATUS": status, "VARTYPE": "NA", "ISOLATE_DATABASE": "NA",
+                "CHROM": "NA", "POS": "NA", "REF": "NA", "ALT": "NA", "GENE": "NA", "EFFECT": "",
+                "PETG_STATUS": petg_status, "NOTE": "",
+            }
+            if status == STATUS_REFERENCE and reference_entry:
+                row.update({"VARTYPE": reference_entry.vartype, "ISOLATE_DATABASE": reference_entry.isolate,
+                            "CHROM": reference_entry.chrom, "NOTE": reference_entry.note})
+            subtype_rows.append(row)
 
     prefix = args.prefix
     write_tsv(f"{prefix}_phenotype_report.tsv", PHENOTYPE_COLUMNS, phenotype_rows)
@@ -1107,11 +1246,16 @@ def parse_args(argv=None):
     parser.add_argument("--vcf-suffix", default="_snpeff.vcf", help="Suffix removed from VCF file names to get the sample")
     parser.add_argument("--include-nonpass", action="store_true", help="Also use VCF records whose FILTER is not PASS")
     parser.add_argument("--rescued", nargs="*", help="Per-sample <sample>_snps.rescued.tsv files (Illumina)")
-    parser.add_argument("--coverage", nargs="*", help="Per-sample coverage files (snippy aligned FASTA or samtools depth -a)")
-    parser.add_argument("--coverage-suffix", default="_snps.aligned.fa", help="Suffix removed from coverage file names")
+    parser.add_argument("--coverage", nargs="*", help="Per-sample samtools depth -a tables over the LPS reference")
+    parser.add_argument("--coverage-suffix", default="_depth.tsv", help="Suffix removed from coverage file names")
+    parser.add_argument("--called", nargs="*",
+                        help="Per-sample output files of variant calling (any file named <sample><suffix>). "
+                             "A typed sample without one is reported as not assessed; omit to assume calling ran")
+    parser.add_argument("--called-suffix", default="_depth.tsv", help="Suffix removed from --called file names")
     parser.add_argument("--min-coverage", type=float, default=DEFAULT_MIN_COVERAGE,
                         help="Minimum covered fraction of a CDS before it is called uncertain (default 0.9)")
-    parser.add_argument("--min-depth", type=int, default=1, help="Minimum depth counted as covered for depth tables")
+    parser.add_argument("--min-depth", type=int, default=DEFAULT_MIN_DEPTH,
+                        help="Minimum depth counted as covered (default 10)")
     parser.add_argument("--min-confident-af", type=float, default=MIXED_AF,
                         help="Uncurated calls below this allele fraction are low-confidence (default 0.9)")
     parser.add_argument("--homopolymer-min-run", type=int, default=0,

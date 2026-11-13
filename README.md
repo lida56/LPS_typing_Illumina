@@ -159,14 +159,102 @@ It is produced by `bin/lps_phenotype.py`, which is shared with the ONT pipeline,
 * `databases/LPS/LPS_subtype_database_v3.txt`: the curated subtypes, with an optional curated `EFFECT` per variant
 * the sample's variants (all Snippy calls in `snps.tab` (including the majority-allele 0/1 calls)), the per-gene read coverage and the petG status
 
+#### How a phenotype is assigned
+
+Before these steps the sample gets a subtype status (see "Subtype status"), which can withhold the phenotype altogether.
+After that each sample goes through four steps.
+
+1. Every gene named in `phenotype_rules.tsv` gets one **gene state** from the sample's variants and read coverage (see "Gene states").
+2. *petG* gets a **petG state** from the BLAST result (see "petG states").
+3. The **lowest step** that contains an `inactivating` gene decides the step. If no gene is inactivating, the `full` row is used.
+4. Among the rule rows for that step, the first one whose `PETG` and `REQUIRES` conditions are met gives the phenotype.
+
+Worked examples with the L1 rules:
+
+* *pcgB* has a frameshift and *petG* is functional. Step 3 is the lowest inactivated step, so the phenotype is `L1_P3`.
+* *hptE* (step 1) and *pcgB* (step 3) are both inactivating. Step 1 is lower, so the phenotype is `L1_P6`, whatever *petG* is.
+* *pcgB* has an in-frame indel (state `uncertain`) and *petG* is nonfunctional. If *pcgB* were functional the `full` row gives `L1_P2`. If it were inactivating, step 3 gives `L1_P4`. Both are reported as `L1_P2 | L1_P4`.
+
+#### Curated variants
+
+A variant is **curated** when it is listed in the [LPS subtype database](databases/LPS/LPS_subtype_database_v3.txt).
+A sample variant matches a database row when the reference sequence, position, reference allele and alternate allele are all the same.
+Curators can set an optional `EFFECT` on a database row:
+
+* `inactivating`: the variant is known to abolish the gene's function
+* `modifying`: the variant is known to change the structure the gene makes (for example an amino acid change that makes the enzyme act like a different one)
+* `none`: the variant is known to have no effect
+* blank: no curated effect, so the gene state is derived from the variant itself (stop gained, frameshift and so on)
+
+A subtype row with `VARTYPE` = `reference` and no position is the type's reference sequence, for example L3-1 (Pm70).
+It is never matched by a variant; it is reported when a sample has no variants in the locus (see "Subtype status").
+Other rows without a position (for example L3-3 and L3-4) are subtypes whose causative variants are not known yet, so they cannot be matched either.
+
+A variant that is not in the database is **uncurated**.
+Uncurated variants can still make a gene `inactivating` or `uncertain` through the rules below, and the phenotype basis flags them as candidates for curation.
+
+#### Subtype status
+
+Every sample also gets a `SUBTYPE_STATUS` that says how far the subtype assignment could be taken.
+It is decided before the phenotype and can stop a phenotype from being given.
+
+| Status | When | Subtype | Phenotype |
+|---|---|---|---|
+| `assigned` | At least one variant matches the subtype database | The matched subtype(s) | From the rules (for L3 see "Types that need a database subtype") |
+| `reference_identical` | No variants anywhere in the LPS locus, and every CDS of the reference is covered (see "Coverage") | The reference subtype (`VARTYPE = reference` in the database, for example L3-1), or `reference` if the database has none | From the `full` row |
+| `uncurated_variants` | There are variants in the locus and none of them is in the database | `Not assigned` | L1: from the rules. L3: `Not predicted` |
+| `not_assessed` | Variant calling produced no output for the sample (Snippy did not run for it (no `_depth.tsv` was produced)), or there are no variants but the locus is not fully covered or has no coverage data | `Not assigned` | `Not predicted` |
+| `not_applicable` | The sample is untypeable | `Not assigned` | `Not predicted` |
+
+`reference_identical` and `not_assessed` are separated by coverage.
+A missing gene leaves no variant, so it looks the same as an unchanged one; without the coverage check a failed or partial run would be reported as identical to the reference.
+
+`Not predicted` is written to `PREDICTED_PHENOTYPE` (and its description) instead of a blank whenever no phenotype is given: untypeable, no rules for the type, not assessed, a type that needs a database subtype and has none, or no matching rule row.
+`Not assigned` is written to `SUBTYPES` and `SUBTYPE` instead of `NA` or a blank.
+Both are filterable text, and `SUBTYPE_STATUS` says why.
+
+#### Types that need a database subtype
+
+L3 structures are not explained by inactivating mutations alone.
+For example, curators report that P1059 (L3_P2) and P1662 (L3_P4) have chemically determined structures without a known inactivating mutation.
+So a type with `CURATED_ONLY = yes` in `phenotype_rules.tsv` (currently L3) gives a phenotype only when the database supports it:
+
+* `reference_identical`: the `full` row is used (L3_P1), because the sequence is the reference, whose structure was determined.
+* `assigned`: the rules are run twice, once with all variants and once with only the curated ones.
+  If both give the same phenotype it is reported, and any uncurated variants are flagged.
+  If they differ, the phenotype is `Not predicted`.
+* `uncurated_variants`: `Not predicted`, however the rules would score the variants.
+* In every `Not predicted` case the basis says what the rules alone would give and lists the uncurated variants, so the isolate can be curated.
+
+Examples (hypothetical isolates):
+
+* L3-6 (*natC*, step 6) plus a new *hptE* stop (step 1). With all variants the rules give L3_P7, with only the curated ones L3_P2. The two differ, so the phenotype is `Not predicted`.
+* L3-12 (*hptE*, step 1) plus a new *natC* stop (step 6). *hptE* wins either way, so L3_P7 is reported and the *natC* variant is flagged as uncurated.
+
+L1 does not need a database subtype: X73 (L1_P1) and VP161 (L1_P2) are both structure-determined, so the L1 rules apply in every status except `not_assessed` and `not_applicable`.
+
+#### Coverage
+
+Both pipelines measure coverage the same way: `samtools depth -a` on the reads mapped to the type's LPS reference (Snippy's `snps.bam`).
+A position is covered at a depth of at least `--phenotype_min_depth` (default 10), and a CDS is adequately covered when at least `--phenotype_min_gene_coverage` (default 90%) of its positions are covered.
+The depth table is kept as `<sample>/8_snippy/<sample>_depth.tsv`.
+
+It is used in two places, both because a deleted or unread gene leaves no variant and would otherwise read as intact:
+
+* a rule gene below the threshold is `uncertain`
+* a sample with no variants is `reference_identical` only if every CDS of the reference passes (not only the rule genes); otherwise it is `not_assessed`, and the basis names the genes that failed
+
 #### Gene states
 
-Each gene named in the rules gets one state, computed from all of the sample's variants inside its CDS (coordinates from the reference GenBank file):
+Each rule gene gets exactly one state, computed from all of the sample's variants inside its CDS (coordinates from the reference GenBank file).
+If several states apply, the first one in this table wins.
 
-1. `inactivating`: a variant is curated `EFFECT=inactivating`; or snpEff reports `stop_gained` or `start_lost`; or an indel touches the start or stop codon; or the net indel length in the gene is not a multiple of 3 (net frameshift)
-2. `uncertain`: the reading frame is intact but altered (an in-frame indel, or frameshifts that cancel out, such as L1-3 + L1-4 in pcgB, net +9 bp); or snpEff reports `stop_lost`; or less than `--phenotype_min_gene_coverage` (default 90%) of the CDS is covered by reads
-3. `modifying`: a variant is curated `EFFECT=modifying` (an amino acid change known to change the structure; acts only through a `REQUIRES` rule)
-4. `functional`: anything else, including plain substitutions
+| State | When | Effect on the phenotype |
+|---|---|---|
+| `inactivating` | A variant is curated `EFFECT=inactivating`, or snpEff reports `stop_gained` or `start_lost`, or an indel touches the start or stop codon, or the net indel length in the gene is not a multiple of 3 (net frameshift) | Selects the step of the gene |
+| `uncertain` | The reading frame is intact but altered (an in-frame indel, or frameshifts that cancel out, such as L1-3 + L1-4 in *pcgB*, net +9 bp), or snpEff reports `stop_lost`, or less than `--phenotype_min_gene_coverage` (default 90%) of the CDS is covered by reads | Evaluated both ways, see "Uncertain calls" |
+| `modifying` | A variant is curated `EFFECT=modifying`. One such variant is enough, and every `modifying` variant counts the same | None on its own. Only a `REQUIRES` condition can use it |
+| `functional` | Anything else, including plain substitutions | None |
 
 Variants curated `EFFECT=none` are ignored, which is how an `uncertain` call is resolved as functional once there is evidence.
 
@@ -179,21 +267,83 @@ Confidence uses the allele fraction from Snippy's rescued 0/1 calls (`snps.rescu
 If leaving the low-confidence calls out changes the gene state, the gene is `uncertain` and the basis names the call, for example `uncertain: hptE depends on a low-confidence call (1bp ins at 5155: AF=0.63, extends a GGG run)`.
 The gate can only widen a call to `uncertain`; it never makes a call more definite.
 No translation is done, so a stop codon between two compensating frameshifts cannot be seen; this is why such genes are `uncertain` rather than `functional`.
-Per-gene coverage comes from Snippy's `snps.aligned.fa` (positions with depth below `--snippy_mincov` count as not covered); without it a deleted gene would have no variants and would read as functional.
+
+#### petG states
+
+| petG status | Meaning | Value used by the rules |
+|---|---|---|
+| `functional` | Hit found, no frameshift, premature stop or lost start | `functional` |
+| `nonfunctional` | Net frameshift, premature stop codon or lost start codon | `nonfunctional` |
+| `absent` | No hit passes the thresholds | `nonfunctional` |
+| `uncertain` | Reading frame restored by compensating frameshifts, or an in-frame indel | both `functional` and `nonfunctional` |
+| `not assessed` | petG detection was skipped | both `functional` and `nonfunctional` |
+
+*petG* only matters for types that have a rule row with `PETG` set to `functional` or `nonfunctional` (currently L1).
+For types whose rows are all `any` (currently L3), the *petG* status is ignored.
 
 #### Phenotype rules
 
-`phenotype_rules.tsv` has one row per phenotype with the columns `TYPE`, `STEP`, `GENES`, `PETG`, `REQUIRES` and `PHENOTYPE`:
+`phenotype_rules.tsv` has one row per phenotype:
 
-* `STEP` is the position of the gene(s) in biosynthetic order (1 = the residue closest to the inner core); `full` is the row used when no rule gene is inactivated
-* `GENES` lists the interchangeable genes of that step, for example `pcgA,pcgB,pcgC,pcgD`
-* `PETG` is `functional`, `nonfunctional` or `any`; `absent` counts as `nonfunctional`
-* `REQUIRES` is an optional extra condition such as `gctD:modifying`; rows with a condition are checked before rows without
+| Column | Meaning |
+|---|---|
+| `TYPE` | LPS outer core type (L1, L3, ...) |
+| `STEP` | Position of the gene(s) in biosynthetic order, 1 = the residue closest to the inner core. `full` is the row used when no rule gene is inactivated |
+| `GENES` | The interchangeable genes of that step, for example `pcgA,pcgB,pcgC,pcgD`. `-` for `full` rows |
+| `PETG` | `functional`, `nonfunctional` or `any` (see "petG states") |
+| `REQUIRES` | Optional extra condition, `-` if none (see below) |
+| `PHENOTYPE` | The phenotype reported |
+| `CURATED_ONLY` | `yes` or `no` (default `no`), the same on every row of a type. `yes` means a phenotype is only given when a database subtype supports it (see "Types that need a database subtype") |
 
-The phenotype is the rule row of the **lowest inactivated step** whose `PETG` matches the sample.
-Uncertain genes (and an uncertain or unassessed petG) are evaluated both ways, and every distinct result is reported, for example `L1_P1 | L1_P3`.
-Types without rules (currently L2 and L4 to L9) get no phenotype.
-Adding a type, a step or a petG split is a change to `phenotype_rules.tsv` only; the rules file is validated at run time (gene names must be CDS in the type's reference, every type needs a `full` row).
+The current file:
+
+```
+TYPE  STEP  GENES                PETG           REQUIRES  PHENOTYPE  CURATED_ONLY
+L1    1     hptE                 any            -         L1_P6      no
+L1    2     gatA                 any            -         L1_P5      no
+L1    3     pcgA,pcgB,pcgC,pcgD  functional     -         L1_P3      no
+L1    3     pcgA,pcgB,pcgC,pcgD  nonfunctional  -         L1_P4      no
+L1    full  -                    functional     -         L1_P1      no
+L1    full  -                    nonfunctional  -         L1_P2      no
+L3    1     hptE                 any            -         L3_P7      yes
+L3    2     gctC                 any            -         L3_P6      yes
+L3    3     gatF                 any            -         L3_P5      yes
+L3    4     gatG                 any            -         L3_P4      yes
+L3    5     natB                 any            -         L3_P3      yes
+L3    6     natC                 any            -         L3_P2      yes
+L3    full  -                    any            -         L3_P1      yes
+```
+
+Types without rules (currently L2 and L4 to L9) report `Not predicted`.
+Adding a type, a step or a petG split is a change to `phenotype_rules.tsv` only.
+The file is validated at run time: gene names must be CDS in the type's reference, every type needs a `full` row, a gene can appear at only one step, `CURATED_ONLY` must be the same on every row of a type, and duplicate rows are rejected.
+
+##### REQUIRES
+
+`REQUIRES` makes a row more specific than the plain row for the same step.
+
+* Format: `gene:state`, with several conditions joined by `;` (all must hold), for example `hptE:modifying;gatA:functional`.
+* The state must be `inactivating`, `modifying` or `functional`.
+* The gene must be a CDS in the type's reference. It does not need to be a step gene.
+* A condition is met when the gene's computed state equals the stated state (see "Gene states"). `REQUIRES` cannot name individual variants. For `gene:modifying`, a single curated `modifying` variant in the gene is enough, and several such variants have the same effect as one. Any `inactivating` or `uncertain` signal in the same gene overrides `modifying`, so the condition is then not met.
+* Rows with a `REQUIRES` are tried first, then rows without. The first row whose `PETG` and `REQUIRES` both match is used. If no `REQUIRES` row matches, the plain row applies.
+* `REQUIRES` also works on `full` rows.
+* If several rows match, the one earlier in the file wins, so avoid overlapping rows.
+
+Example (hypothetical):
+
+```
+L1  3  pcgA,pcgB,pcgC,pcgD  functional  hptE:modifying  L1_Px
+```
+
+This applies only when the lowest inactivated step is 3, *petG* is functional and *hptE* carries a curated modifying variant.
+Otherwise the plain step-3 row applies.
+
+#### Uncertain calls
+
+An `uncertain` gene (and an uncertain or unassessed *petG*) is evaluated both ways, and every distinct phenotype is reported, for example `L1_P1 | L1_P3`.
+For a gene, the rules are run twice, once treating it as `functional` and once as `inactivating`, and `REQUIRES` is checked against those assumed states.
+So a condition like `hptE:modifying` is never met while *hptE* is `uncertain`, and `hptE:uncertain` can never be met at all.
 
 #### Phenotype basis
 
@@ -203,7 +353,13 @@ Adding a type, a step or a petG split is a change to `phenotype_rules.tsv` only;
 * `uncertain: ...`: the call depends on an uncertain gene or petG; the text names the gene, the reason and the phenotype for each alternative
 * `uncurated: ...`: a variant that is not in the subtype database changed a gene state (the variants are listed, and `SUBTYPES` includes `novel`); these are candidates for curation
 * `mixed call: ...` (suffix): a curated variant that changed a gene state has an allele fraction below 0.9 (rescued 0/1 calls with alt fraction < 0.9 (`snps.rescued.tsv`))
+* `uncurated variants: ...`: the sample has variants in the locus that are not in the subtype database and did not change a gene state (listed with their gene, up to 8)
+* `not predicted: ...; the rules alone would give ...`: the type needs a database subtype and none supports the call (see "Types that need a database subtype")
+* `not assessed: ...`: the subtype status is `not_assessed`; the text gives the reason
+* `no variants in the locus (identical to the reference)`: the subtype status is `reference_identical`
 * `no phenotype rules for type`, `untypeable`
+
+`LPS_GENE_STATES` lists only the genes that are not plainly functional, as `gene:state` separated by `;`, for example `gatG:inactivating;natB:inactivating`.
 
 ### 12. Genome annotation using Bakta
 
@@ -426,6 +582,7 @@ The subtype and phenotype reports use `LPS_subtype_database_v3.txt`, `phenotype_
 * `--subtype_database`: subtype database (default="" = `LPS_subtype_database_v3.txt` in `--reference_LPS_directory`)
 * `--phenotype_rules`: phenotype rules file (default="" = `phenotype_rules.tsv` in `--reference_LPS_directory`)
 * `--phenotype_min_gene_coverage`: minimum covered fraction of a rule gene's CDS; below it the gene is `uncertain` (default=0.9)
+* `--phenotype_min_depth`: minimum read depth for a position to count as covered, measured with `samtools depth` on the Snippy BAM (default=10)
 * `--phenotype_min_confident_af`: uncurated variant calls below this allele fraction are low-confidence (default=0.9)
 * `--phenotype_homopolymer_min_run`: uncurated indels of a base in a reference run of at least this length are low-confidence (default=0, i.e. off)
 
@@ -510,7 +667,8 @@ The `10_report` folder contains combined results across all samples:
   * **SAMPLE**: sample identifier
   * **MLST**: MLST sequence type
   * **TYPE**: LPS type assigned by Kaptive (or `untypeable`)
-  * **SUBTYPE**: LPS subtype from the subtype database
+  * **SUBTYPE**: LPS subtype from the subtype database; the reference subtype for a `reference_identical` sample, or `Not assigned`
+  * **SUBTYPE_STATUS**: `assigned`, `reference_identical`, `uncurated_variants`, `not_assessed` or `not_applicable` (see "Subtype status")
   * **VARTYPE**: description of the variant
   * **ISOLATE_DATABASE**: reference isolate from the subtype database
   * **CHROM**: reference sequence name for the LPS locus
@@ -523,13 +681,14 @@ The `10_report` folder contains combined results across all samples:
   * **NOTE**: subtype database note for the matched variant, when available
 * Phenotype report (`10_Illumina_phenotype_report.tsv`), one row per sample. Column descriptions:
   * **SAMPLE**, **MLST**, **TYPE**: as in the subtype report
-  * **SUBTYPES**: matched subtypes, separated by `;` (`novel` when an uncurated variant changed a gene state)
+  * **SUBTYPES**: matched subtypes, separated by `;` (`novel` is added when an uncurated variant changed a gene state); the reference subtype for a `reference_identical` sample; `Not assigned` otherwise
+  * **SUBTYPE_STATUS**: as in the subtype report
   * **PETG_STATUS**, **PETG_DETAIL**: petG status and the reason or hit location
   * **LPS_GENE_STATES**: rule genes that are not plainly functional, e.g. `gatG:inactivating;natB:inactivating`
   * **DETERMINING_GENE**: the inactivated gene of the lowest step (`none` when no rule gene is inactivated)
-  * **PREDICTED_PHENOTYPE**: predicted phenotype; alternatives are separated by ` | ` when the call is uncertain
-  * **PREDICTED_PHENOTYPE_DESCRIPTION**: description(s) from `phenotype_lookup.tsv`
-  * **PHENOTYPE_BASIS**: `curated`, `uncertain: ...`, `uncurated: ...`, `no phenotype rules for type` or `untypeable`, plus an optional `mixed call: ...` suffix
+  * **PREDICTED_PHENOTYPE**: predicted phenotype; alternatives are separated by ` | ` when the call is uncertain; `Not predicted` when no phenotype is given
+  * **PREDICTED_PHENOTYPE_DESCRIPTION**: description(s) from `phenotype_lookup.tsv`, or `Not predicted`
+  * **PHENOTYPE_BASIS**: `curated`, `uncertain: ...`, `uncurated: ...`, `uncurated variants: ...`, `not predicted: ...`, `not assessed: ...`, `no phenotype rules for type` or `untypeable`, plus an optional `mixed call: ...` suffix
 * petG status per sample (`10_Illumina_petG_status.tsv`)
 * AMRFinderPlus combined results (`12_Illumina_amrfinder.tsv`)
 

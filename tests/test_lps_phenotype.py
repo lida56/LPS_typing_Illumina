@@ -37,9 +37,17 @@ def novel(chrom, pos, ref, alt, effects=(), sample="S"):
     return lp.Variant(sample, chrom, pos, ref, alt, set(effects))
 
 
-def call(lps_type, variants, petg="functional", coverage=None):
+def full_coverage(lps_type):
+    reference = REFERENCES[lps_type]
+    return {reference.record: set(range(1, len(reference.sequence) + 1))}
+
+
+def call(lps_type, variants, petg="functional", coverage="full", called=True):
+    """Phenotype fields for one sample; every position is covered unless a coverage map is given."""
+    if isinstance(coverage, str):
+        coverage = full_coverage(lps_type) if lps_type in REFERENCES else None
     fields, _ = lp.phenotype_for_sample(
-        "S", lps_type, RULES.get(lps_type), REFERENCES.get(lps_type), variants, petg, coverage, 0.9)
+        "S", lps_type, RULES.get(lps_type), REFERENCES.get(lps_type), variants, petg, coverage, 0.9, called)
     return fields
 
 
@@ -132,17 +140,21 @@ class GeneStateRules(unittest.TestCase):
         self.assertEqual(fields["PREDICTED_PHENOTYPE"], "L1_P5")
 
     def test_plain_substitutions_are_functional(self):
-        gene = REFERENCES["L3"].genes["natC"]
-        fields = call("L3", [novel(L3, gene.start + 10, "A", "G", {"missense_variant"})])
-        self.assertEqual(fields["PREDICTED_PHENOTYPE"], "L3_P1")
-        self.assertEqual(fields["PHENOTYPE_BASIS"], "curated")
+        gene = REFERENCES["L1"].genes["gatA"]
+        fields = call("L1", [novel(L1, gene.start + 10, "A", "G", {"missense_variant"})])
+        self.assertEqual(fields["PREDICTED_PHENOTYPE"], "L1_P1")
+        self.assertEqual(fields["SUBTYPE_STATUS"], "uncurated_variants")
+        self.assertEqual(fields["LPS_GENE_STATES"], "")
+        self.assertIn("uncurated variants: A>G at", fields["PHENOTYPE_BASIS"])
+        self.assertIn("(gatA)", fields["PHENOTYPE_BASIS"])
 
     def test_in_frame_deletion_is_uncertain(self):
         gene = REFERENCES["L3"].genes["gatG"]
         pos = gene.start + 100
         ref = REFERENCES["L3"].sequence[pos - 1:pos + 3]
         fields = call("L3", [novel(L3, pos, ref, ref[0])])
-        self.assertEqual(fields["PREDICTED_PHENOTYPE"], "L3_P1 | L3_P4")
+        self.assertEqual(fields["PREDICTED_PHENOTYPE"], "Not predicted")
+        self.assertIn("the rules alone would give L3_P1 | L3_P4", fields["PHENOTYPE_BASIS"])
         self.assertIn("in-frame indel", fields["PHENOTYPE_BASIS"])
 
     def test_l3_29_large_deletion_hits_gatf(self):
@@ -151,16 +163,17 @@ class GeneStateRules(unittest.TestCase):
         self.assertEqual(fields["DETERMINING_GENE"], "gatF")
 
     def test_intergenic_indel_ignored(self):
-        fields = call("L3", [novel(L3, 10, "A", "AT")])
-        self.assertEqual(fields["PREDICTED_PHENOTYPE"], "L3_P1")
+        fields = call("L1", [novel(L1, 10, "A", "AT")])
+        self.assertEqual(fields["PREDICTED_PHENOTYPE"], "L1_P1")
+        self.assertIn("(intergenic)", fields["PHENOTYPE_BASIS"])
 
     def test_low_coverage_gene_is_uncertain(self):
-        reference = REFERENCES["L3"]
-        gene = reference.genes["natB"]
+        reference = REFERENCES["L1"]
+        gene = reference.genes["gatA"]
         covered = {reference.record: set(range(1, len(reference.sequence) + 1)) - set(range(gene.start, gene.end))}
-        fields = call("L3", [], coverage=covered)
-        self.assertEqual(fields["PREDICTED_PHENOTYPE"], "L3_P1 | L3_P3")
-        self.assertIn("natB only 0% covered", fields["PHENOTYPE_BASIS"])
+        fields = call("L1", [db_variant("L1-2")], coverage=covered)
+        self.assertEqual(fields["PREDICTED_PHENOTYPE"], "L1_P3 | L1_P5")
+        self.assertIn("gatA only 0% covered", fields["PHENOTYPE_BASIS"])
 
     def test_requires_row(self):
         ruleset = lp.RuleSet("LX")
@@ -175,8 +188,9 @@ class GeneStateRules(unittest.TestCase):
 
     def test_type_without_rules(self):
         fields = call("L4", [])
-        self.assertEqual(fields["PREDICTED_PHENOTYPE"], "")
+        self.assertEqual(fields["PREDICTED_PHENOTYPE"], "Not predicted")
         self.assertEqual(fields["PHENOTYPE_BASIS"], "no phenotype rules for type")
+        self.assertEqual(fields["SUBTYPE_STATUS"], "reference_identical")
 
     def test_untypeable(self):
         self.assertEqual(call("untypeable", [])["PHENOTYPE_BASIS"], "untypeable")
@@ -206,7 +220,8 @@ class VcfInput(unittest.TestCase):
         # Uncurated stop at AF 0.58 is low-confidence: gatG becomes uncertain, not inactivating
         lp.assess_confidence(variants[0], REFERENCES["L3"].sequence)
         fields = call("L3", variants)
-        self.assertEqual(fields["PREDICTED_PHENOTYPE"], "L3_P1 | L3_P4")
+        self.assertEqual(fields["PREDICTED_PHENOTYPE"], "Not predicted")
+        self.assertIn("the rules alone would give L3_P1 | L3_P4", fields["PHENOTYPE_BASIS"])
         self.assertIn("gatG depends on a low-confidence call (C>A at 2041: AF=0.579)", fields["PHENOTYPE_BASIS"])
 
 
@@ -266,8 +281,14 @@ class ConfidenceGate(unittest.TestCase):
         stop.af = 0.98
         lp.assess_confidence(stop, REFERENCES["L3"].sequence, 0.9, 3)
         fields = call("L3", [stop])
-        self.assertEqual(fields["PREDICTED_PHENOTYPE"], "L3_P7")
-        self.assertTrue(fields["PHENOTYPE_BASIS"].startswith("uncurated: hptE inactivating"))
+        # L3 gives no phenotype without a database subtype, but the basis still says what the rules see
+        self.assertEqual(fields["PREDICTED_PHENOTYPE"], "Not predicted")
+        self.assertIn("the rules alone would give L3_P7", fields["PHENOTYPE_BASIS"])
+        self.assertIn("uncurated: hptE inactivating", fields["PHENOTYPE_BASIS"])
+        # L1 has no such restriction
+        hpte = REFERENCES["L1"].genes["hptE"]
+        l1_stop = novel(L1, hpte.start + 300, "C", "T", {"stop_gained"})
+        self.assertEqual(call("L1", [l1_stop])["PREDICTED_PHENOTYPE"], "L1_P6")
 
     def test_curated_variant_in_homopolymer_counts(self):
         variants = [db_variant("L1-4")]
@@ -286,6 +307,210 @@ class ConfidenceGate(unittest.TestCase):
         self.assertEqual(call("L1", [ins, dele])["PREDICTED_PHENOTYPE"], "L1_P1 | L1_P6")
 
 
+def non_rule_gene(lps_type):
+    """A CDS of the reference that no phenotype rule uses."""
+    return next(g for name, g in REFERENCES[lps_type].genes.items() if name not in RULES[lps_type].genes)
+
+
+class SubtypeStatus(unittest.TestCase):
+    """SUBTYPE_STATUS and the L3 rule that a phenotype needs a subtype in the database."""
+
+    def test_l3_without_variants_is_reference_identical(self):
+        fields = call("L3", [])
+        self.assertEqual(fields["SUBTYPE_STATUS"], "reference_identical")
+        self.assertEqual(fields["PREDICTED_PHENOTYPE"], "L3_P1")
+        self.assertEqual(fields["PHENOTYPE_BASIS"], "no variants in the locus (identical to the reference)")
+
+    def test_l3_with_unlisted_variant_is_not_predicted(self):
+        gene = REFERENCES["L3"].genes["natC"]
+        fields = call("L3", [novel(L3, gene.start + 10, "A", "G", {"missense_variant"})])
+        self.assertEqual(fields["SUBTYPE_STATUS"], "uncurated_variants")
+        self.assertEqual(fields["PREDICTED_PHENOTYPE"], "Not predicted")
+        self.assertTrue(fields["PHENOTYPE_BASIS"].startswith(
+            "not predicted: no subtype in the database matches this isolate; the rules alone would give L3_P1"))
+        self.assertIn("uncurated variants: A>G at", fields["PHENOTYPE_BASIS"])
+        self.assertIn("(natC)", fields["PHENOTYPE_BASIS"])
+
+    def test_l3_matched_subtype_is_predicted(self):
+        fields = call("L3", [db_variant("L3-6")])
+        self.assertEqual(fields["SUBTYPE_STATUS"], "assigned")
+        self.assertEqual(fields["PREDICTED_PHENOTYPE"], "L3_P2")
+        self.assertEqual(fields["PHENOTYPE_BASIS"], "curated")
+
+    def test_matched_subtype_plus_uncurated_variant_that_changes_the_result(self):
+        # L3-6 (natC, step 6) alone is L3_P2, but a new hptE stop (step 1) would make it L3_P7
+        stop = novel(L3, 5349, "T", "A", {"stop_gained"})
+        fields = call("L3", [db_variant("L3-6"), stop])
+        self.assertEqual(fields["SUBTYPE_STATUS"], "assigned")
+        self.assertEqual(fields["PREDICTED_PHENOTYPE"], "Not predicted")
+        self.assertEqual(fields["DETERMINING_GENE"], "")
+        self.assertIn("an uncurated variant changes the phenotype; the rules alone would give L3_P7",
+                      fields["PHENOTYPE_BASIS"])
+        self.assertIn("natC:inactivating", fields["LPS_GENE_STATES"])
+        self.assertIn("hptE:inactivating", fields["LPS_GENE_STATES"])
+
+    def test_matched_subtype_plus_uncurated_variant_that_changes_nothing(self):
+        # L3-12 (hptE, step 1) wins whatever happens at step 6, so L3_P7 is safe to report
+        gene = REFERENCES["L3"].genes["natC"]
+        stop = novel(L3, gene.start + 300, "C", "A", {"stop_gained"})
+        fields = call("L3", [db_variant("L3-12"), stop])
+        self.assertEqual(fields["PREDICTED_PHENOTYPE"], "L3_P7")
+        self.assertEqual(fields["DETERMINING_GENE"], "hptE")
+        self.assertIn("uncurated: natC inactivating", fields["PHENOTYPE_BASIS"])
+
+    def test_l1_keeps_its_rules_without_a_subtype(self):
+        gene = REFERENCES["L1"].genes["hptE"]
+        fields = call("L1", [novel(L1, gene.start + 300, "C", "T", {"stop_gained"})])
+        self.assertEqual(fields["SUBTYPE_STATUS"], "uncurated_variants")
+        self.assertEqual(fields["PREDICTED_PHENOTYPE"], "L1_P6")
+
+    def test_calling_that_did_not_run_is_not_assessed(self):
+        for lps_type in ("L1", "L3", "L4"):
+            fields = call(lps_type, [], called=False)
+            self.assertEqual(fields["SUBTYPE_STATUS"], "not_assessed")
+            self.assertEqual(fields["PREDICTED_PHENOTYPE"], "Not predicted")
+            self.assertTrue(fields["PHENOTYPE_BASIS"].startswith("not assessed: no variant calling output"))
+
+    def test_no_variants_needs_coverage_data(self):
+        fields = call("L3", [], coverage=None)
+        self.assertEqual(fields["SUBTYPE_STATUS"], "not_assessed")
+        self.assertEqual(fields["PREDICTED_PHENOTYPE"], "Not predicted")
+        self.assertIn("no coverage data", fields["PHENOTYPE_BASIS"])
+
+    def test_no_variants_but_a_gap_anywhere_in_the_locus_is_not_assessed(self):
+        # L3 has only rule genes; L1 also has genes that no rule uses (a gap there must count too)
+        cases = [("L3", REFERENCES["L3"].genes["natB"]), ("L1", non_rule_gene("L1"))]
+        for lps_type, gene in cases:
+            with self.subTest(type=lps_type, gene=gene.name):
+                reference = REFERENCES[lps_type]
+                covered = {reference.record: set(range(1, len(reference.sequence) + 1)) - set(range(gene.start, gene.end + 1))}
+                fields = call(lps_type, [], coverage=covered)
+                self.assertEqual(fields["SUBTYPE_STATUS"], "not_assessed")
+                self.assertEqual(fields["PREDICTED_PHENOTYPE"], "Not predicted")
+                self.assertIn(f"{gene.name} 0%", fields["PHENOTYPE_BASIS"])
+
+    def test_untypeable_is_not_applicable(self):
+        fields = call("untypeable", [])
+        self.assertEqual(fields["SUBTYPE_STATUS"], "not_applicable")
+        self.assertEqual(fields["PREDICTED_PHENOTYPE"], "Not predicted")
+
+    def test_reference_subtypes_are_marked_in_the_database(self):
+        marked = {e.type: e.subtype for e in DB_ENTRIES if e.is_reference}
+        self.assertEqual(marked["L1"], "L1-1")
+        self.assertEqual(marked["L3"], "L3-1")
+        # L3-3 and L3-4 have no coordinates either, but they are not the reference sequence
+        self.assertFalse(next(e for e in DB_ENTRIES if e.subtype == "L3-3").is_reference)
+        self.assertFalse(next(e for e in DB_ENTRIES if e.subtype == "L3-4").is_reference)
+        self.assertFalse(any(e.matchable for e in DB_ENTRIES if e.is_reference))
+
+    def test_l1_6_is_labelled_as_the_deletion_it_is(self):
+        entry = next(e for e in DB_ENTRIES if e.subtype == "L1-6")
+        self.assertEqual((entry.ref, entry.alt, entry.vartype), ("TA", "T", "1bp deletion"))
+
+    def test_vartype_matches_allele_lengths(self):
+        for entry in DB_ENTRIES:
+            if not entry.matchable:
+                continue
+            change = len(entry.alt) - len(entry.ref)
+            with self.subTest(subtype=entry.subtype):
+                if "insertion" in entry.vartype:
+                    self.assertGreater(change, 0)
+                elif "deletion" in entry.vartype:
+                    self.assertLess(change, 0)
+                elif entry.vartype.startswith("snp"):
+                    self.assertEqual(change, 0)
+
+    def test_l3_6_with_l3_12_is_p7_by_the_step_rule(self):
+        # The old v2 override "L3-6 + L3-32 = L3_P7" is now just the lowest-step rule
+        fields = call("L3", [db_variant("L3-6"), db_variant("L3-12")])
+        self.assertEqual(fields["PREDICTED_PHENOTYPE"], "L3_P7")
+
+    def test_two_reference_subtypes_for_one_type_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "db.txt"
+            path.write_text("TYPE\tSUBTYPE\tISOLATE\tCHROM\tPOS\tVARTYPE\tREF\tALT\tGENE\tEFFECT\tNOTE\n"
+                            "L3\tL3-1\tA\tc\tNA\treference\tNA\tNA\tNA\t\t\n"
+                            "L3\tL3-2\tB\tc\tNA\treference\tNA\tNA\tNA\t\t\n")
+            with self.assertRaisesRegex(ValueError, "More than one reference subtype"):
+                lp.load_subtype_db(path)
+
+
+class ReportFiles(unittest.TestCase):
+    """The whole script on small input files."""
+
+    def run_reports(self, tmp, called_samples):
+        tmp = Path(tmp)
+        reference = REFERENCES["L3"]
+        kaptive = tmp / "kaptive.tsv"
+        header = "sampleID\tBest match locus\tMatch confidence"
+        kaptive.write_text("\n".join([
+            header,
+            "ASSIGNED\tL3-x\tTypeable",
+            "REFERENCE\tL3-x\tTypeable",
+            "NOVEL\tL3-x\tTypeable",
+            "FAILED\tL3-x\tTypeable",
+            "UNTYPED\tnone\tNot typeable",
+        ]) + "\n")
+        entry = next(e for e in DB_ENTRIES if e.subtype == "L3-6")
+        gene = reference.genes["natC"]
+        snippy = tmp / "snps.tsv"
+        snippy.write_text("\n".join([
+            "sampleID\tCHROM\tPOS\tREF\tALT\tEFFECT",
+            f"ASSIGNED\t{entry.chrom}\t{entry.pos}\t{entry.ref}\t{entry.alt}\tstop_gained",
+            f"NOVEL\t{reference.record}\t{gene.start + 10}\tA\tG\tmissense_variant",
+        ]) + "\n")
+        depth_files = []
+        for sample in ("ASSIGNED", "REFERENCE", "NOVEL", "FAILED"):
+            path = tmp / f"{sample}_depth.tsv"
+            path.write_text("".join(f"{reference.record}\t{i}\t30\n" for i in range(1, len(reference.sequence) + 1)))
+            depth_files.append(str(path))
+        called = [f for f in depth_files if Path(f).name.split("_depth.tsv")[0] in called_samples]
+        prefix = str(tmp / "10_T")
+        code = lp.main([
+            "--lps-db-dir", str(DB), "--subtype-db", str(DB / "LPS_subtype_database_v3.txt"),
+            "--rules", str(DB / "phenotype_rules.tsv"), "--phenotype-lookup", str(DB / "phenotype_lookup.tsv"),
+            "--kaptive", str(kaptive), "--snippy-table", str(snippy),
+            "--coverage", *depth_files, "--coverage-suffix", "_depth.tsv", "--min-depth", "10",
+            "--called", *called, "--called-suffix", "_depth.tsv", "--petg-skipped", "--prefix", prefix,
+        ])
+        self.assertEqual(code, 0)
+        def read(name):
+            with open(f"{prefix}_{name}.tsv", newline="") as handle:
+                return list(csv.DictReader(handle, delimiter="\t"))
+        return {r["SAMPLE"]: r for r in read("phenotype_report")}, read("subtype_report")
+
+    def test_reports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pheno, subtype_rows = self.run_reports(tmp, {"ASSIGNED", "REFERENCE", "NOVEL"})
+        expected = {
+            "ASSIGNED": ("L3-6", "assigned", "L3_P2"),
+            "REFERENCE": ("L3-1", "reference_identical", "L3_P1"),
+            "NOVEL": ("Not assigned", "uncurated_variants", "Not predicted"),
+            "FAILED": ("Not assigned", "not_assessed", "Not predicted"),
+            "UNTYPED": ("Not assigned", "not_applicable", "Not predicted"),
+        }
+        for sample, (subtypes, status, phenotype) in expected.items():
+            with self.subTest(sample=sample):
+                self.assertEqual(pheno[sample]["SUBTYPES"], subtypes)
+                self.assertEqual(pheno[sample]["SUBTYPE_STATUS"], status)
+                self.assertEqual(pheno[sample]["PREDICTED_PHENOTYPE"], phenotype)
+                rows = [r for r in subtype_rows if r["SAMPLE"] == sample]
+                self.assertEqual({r["SUBTYPE"] for r in rows}, {subtypes})
+                self.assertEqual({r["SUBTYPE_STATUS"] for r in rows}, {status})
+        self.assertEqual(pheno["NOVEL"]["PREDICTED_PHENOTYPE_DESCRIPTION"], "Not predicted")
+        reference_row = next(r for r in subtype_rows if r["SAMPLE"] == "REFERENCE")
+        self.assertEqual((reference_row["VARTYPE"], reference_row["ISOLATE_DATABASE"]), ("reference", "Pm70"))
+        untyped_row = next(r for r in subtype_rows if r["SAMPLE"] == "UNTYPED")
+        self.assertEqual(untyped_row["TYPE"], "untypeable")
+
+    def test_sample_without_calling_output_is_never_reference_identical(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pheno, _ = self.run_reports(tmp, {"ASSIGNED", "NOVEL"})
+        # REFERENCE has a depth file but no calling output, exactly like a failed calling run
+        self.assertEqual(pheno["REFERENCE"]["SUBTYPE_STATUS"], "not_assessed")
+        self.assertEqual(pheno["REFERENCE"]["PREDICTED_PHENOTYPE"], "Not predicted")
+
+
 class RulesValidation(unittest.TestCase):
     def write_rules(self, text):
         handle = tempfile.NamedTemporaryFile("w", suffix=".tsv", delete=False)
@@ -302,6 +527,18 @@ class RulesValidation(unittest.TestCase):
         path = self.write_rules("L1\t1\thptE\tany\t-\tL1_P6\n")
         with self.assertRaisesRegex(ValueError, "no 'full' rule row"):
             lp.load_rules(path, REFERENCES)
+
+    def test_curated_only_is_set_for_l3_only(self):
+        self.assertTrue(RULES["L3"].curated_only)
+        self.assertFalse(RULES["L1"].curated_only)
+
+    def test_curated_only_must_be_the_same_for_a_type(self):
+        handle = tempfile.NamedTemporaryFile("w", suffix=".tsv", delete=False)
+        handle.write("TYPE\tSTEP\tGENES\tPETG\tREQUIRES\tPHENOTYPE\tCURATED_ONLY\n"
+                     "L1\t1\thptE\tany\t-\tL1_P6\tyes\nL1\tfull\t-\tany\t-\tL1_P1\tno\n")
+        handle.close()
+        with self.assertRaisesRegex(ValueError, "CURATED_ONLY must be the same"):
+            lp.load_rules(handle.name, REFERENCES)
 
     def test_db_effect_values(self):
         allowed = {"", "none", "modifying", "inactivating"}

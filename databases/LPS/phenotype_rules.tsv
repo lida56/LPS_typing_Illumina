@@ -1,14 +1,14 @@
-TYPE	STEP	GENES	PETG	REQUIRES	PHENOTYPE
-L1	1	hptE	any	-	L1_P6
-L1	2	gatA	any	-	L1_P5
-L1	3	pcgA,pcgB,pcgC,pcgD	functional	-	L1_P3
-L1	3	pcgA,pcgB,pcgC,pcgD	nonfunctional	-	L1_P4
-L1	full	-	functional	-	L1_P1
-L1	full	-	nonfunctional	-	L1_P2
-L3	1	hptE	any	-	L3_P7
-L3	2	gctC	any	-	L3_P6
-L3	3	gatF	any	-	L3_P5
-L3	4	gatG	any	-	L3_P4
-L3	5	natB	any	-	L3_P3
-L3	6	natC	any	-	L3_P2
-L3	full	-	any	-	L3_P1
+TYPE	STEP	GENES	PETG	REQUIRES	PHENOTYPE	CURATED_ONLY
+L1	1	hptE	any	-	L1_P6	no
+L1	2	gatA	any	-	L1_P5	no
+L1	3	pcgA,pcgB,pcgC,pcgD	functional	-	L1_P3	no
+L1	3	pcgA,pcgB,pcgC,pcgD	nonfunctional	-	L1_P4	no
+L1	full	-	functional	-	L1_P1	no
+L1	full	-	nonfunctional	-	L1_P2	no
+L3	1	hptE	any	-	L3_P7	yes
+L3	2	gctC	any	-	L3_P6	yes
+L3	3	gatF	any	-	L3_P5	yes
+L3	4	gatG	any	-	L3_P4	yes
+L3	5	natB	any	-	L3_P3	yes
+L3	6	natC	any	-	L3_P2	yes
+L3	full	-	any	-	L3_P1	yes

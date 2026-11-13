@@ -436,6 +436,7 @@ process snippy {
         publishDir "$params.outdir/$sample/8_snippy",  mode: 'copy', pattern: "*.log", saveAs: { filename -> "${sample}_$filename" }
         publishDir "$params.outdir/$sample/8_snippy",  mode: 'copy', pattern: 'snps*', saveAs: { filename -> "${sample}_$filename" }
 	publishDir "$params.outdir/$sample/8_snippy",  mode: 'copy', pattern: '*tab'
+	publishDir "$params.outdir/$sample/8_snippy",  mode: 'copy', pattern: '*_depth.tsv'
 	input:
                 tuple val(sample), path(reads1_trimmed), path(reads2_trimmed), path(kaptive_report)
 	output:
@@ -446,8 +447,9 @@ process snippy {
 		path("snps.typing.vcf"), optional: true
 		path("snps.rescued.tsv"), optional: true
 		path("*_snps.snippy.tab"), optional: true
-		// Per-sample inputs for phenotype assignment (gene coverage, mixed 0/1 calls)
-		path("${sample}_snps.aligned.fa"), emit: snippy_coverage
+		// Per-sample inputs for phenotype assignment: per-base depth over the LPS reference (made the same
+		// way as in the ONT pipeline; its presence also shows that calling ran) and mixed 0/1 calls
+		path("${sample}_depth.tsv"), emit: snippy_coverage
 		path("${sample}_snps.rescued.tsv"), optional: true, emit: snippy_rescued
         when:
         !params.skip_snippy && !params.skip_kaptive3
@@ -469,7 +471,7 @@ process snippy {
         egrep "^CHROM|frameshift_variant|stop_gained" snps.tab > snps.high_impact.tab
 	mv snps.high_impact.tab ${sample}_snps.high_impact.tab
 	mv snps.tab ${sample}_snps.tab
-	cp snps.aligned.fa ${sample}_snps.aligned.fa
+	samtools depth -a snps.bam > ${sample}_depth.tsv
 	if [[ -f snps.rescued.tsv ]]; then cp snps.rescued.tsv ${sample}_snps.rescued.tsv; fi
 	cp .command.log snippy.log
         """
@@ -586,8 +588,11 @@ process report {
 		--mlst \$(ls *_mlst.csv 2>/dev/null) \\
 		--snippy-table 8_Illumina_snippy_snps.tsv \\
 		--rescued \$(ls *_snps.rescued.tsv 2>/dev/null) \\
-		--coverage *_snps.aligned.fa \\
-		--coverage-suffix _snps.aligned.fa \\
+		--coverage *_depth.tsv \\
+		--coverage-suffix _depth.tsv \\
+		--called *_depth.tsv \\
+		--called-suffix _depth.tsv \\
+		--min-depth ${params.phenotype_min_depth} \\
 		--min-coverage ${params.phenotype_min_gene_coverage} \\
 		--min-confident-af ${params.phenotype_min_confident_af} \\
 		--homopolymer-min-run ${params.phenotype_homopolymer_min_run} \\
@@ -909,6 +914,6 @@ workflow {
 	if (params.skip_petg) skipped_list << 'petG'
 	if (params.skip_amrfinder) skipped_list << 'amrfinder'
 	if (params.skip_bakta) skipped_list << 'bakta'
-	param_note_str = "MLST scheme: ${params.mlst_scheme}; petG assessed when an X73-like hit covers the whole gene (> ${params.petg_min_length} bp at >= ${params.petg_min_identity}% identity); LPS genes below ${params.phenotype_min_gene_coverage * 100}% coverage are called uncertain"
+	param_note_str = "MLST scheme: ${params.mlst_scheme}; petG assessed when an X73-like hit covers the whole gene (> ${params.petg_min_length} bp at >= ${params.petg_min_identity}% identity); LPS genes below ${params.phenotype_min_gene_coverage * 100}% coverage (depth >= ${params.phenotype_min_depth}) are called uncertain"
 	html_report(html_inputs_ch.collect(), workflow.manifest.version, skipped_list.join(', '), param_note_str)
 }

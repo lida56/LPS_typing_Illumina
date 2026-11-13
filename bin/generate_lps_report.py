@@ -465,6 +465,8 @@ def parse_quast(df):
     return out
 
 
+NOT_PREDICTED = "Not predicted"
+NOT_ASSIGNED = "Not assigned"
 PETG_CLASS = {"functional": "ok", "nonfunctional": "bad", "absent": "bad", "uncertain": "flag"}
 
 
@@ -476,7 +478,9 @@ def basis_categories(basis):
     labels = []
     for text, label in (("uncertain", "uncertain"), ("uncurated", "uncurated"),
                         ("low-confidence call", "low-confidence"), ("mixed call", "mixed call"),
-                        ("untypeable", "untypeable"), ("no phenotype rules", "no rules")):
+                        ("untypeable", "untypeable"), ("no phenotype rules", "no rules"),
+                        ("not predicted", "not predicted"), ("not assessed", "not assessed"),
+                        ("identical to the reference", "reference")):
         if text in basis:
             labels.append(label)
     if not labels or basis.startswith("curated"):
@@ -526,15 +530,21 @@ def build_records(report_df, qc, pheno_df=None):
         basis = ""
         gene_states = ""
         petg_detail = ""
+        subtype_status = ""
+        not_predicted = False
         if ph_row is not None:
             phenos = OrderedDict()
             names = [p.strip() for p in clean(ph_row.get("PREDICTED_PHENOTYPE")).split("|") if p.strip()]
             descs = [d.strip() for d in clean(ph_row.get("PREDICTED_PHENOTYPE_DESCRIPTION")).split("|")]
             for i, name in enumerate(names):
                 phenos[name] = descs[i] if i < len(descs) else ""
+            if list(phenos) == [NOT_PREDICTED]:
+                phenos = OrderedDict()
+                not_predicted = True
             petg = clean(ph_row.get("PETG_STATUS"))
             petg_detail = clean(ph_row.get("PETG_DETAIL"))
             basis = clean(ph_row.get("PHENOTYPE_BASIS"))
+            subtype_status = clean(ph_row.get("SUBTYPE_STATUS"))
             gene_states = clean(ph_row.get("LPS_GENE_STATES"))
             lps_type = clean(ph_row.get("TYPE")) or lps_type
             mlst = mlst or clean(ph_row.get("MLST"))
@@ -569,7 +579,9 @@ def build_records(report_df, qc, pheno_df=None):
             "sample": s,
             "type": lps_type,
             "subtypes": subtypes,
+            "subtype_status": subtype_status,
             "phenotypes": phenos,
+            "not_predicted": not_predicted,
             "variants": variants,
             "petg": petg or "no",
             "petg_class": PETG_CLASS.get(petg, ""),
@@ -701,6 +713,8 @@ TEMPLATE = r"""<!DOCTYPE html>
   .pill.basis-curated { background: #dafbe1; color: #1a7f37; }
   .pill.basis-uncertain, .pill.basis-mixed, .pill.basis-low-confidence { background: var(--warn-bg); color: var(--warn-fg); }
   .pill.basis-uncurated { background: #ddf4ff; color: #0550ae; }
+  .pill.basis-not, .pill.none { background: #eaeef2; color: #57606a; }
+  .pill.basis-reference { background: #dafbe1; color: #1a7f37; }
   .tablebar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 8px 0 12px; }
   .tablebar input[type=text] { font-size: 14px; padding: 7px 10px; width: 280px; border: 1px solid var(--line); border-radius: 6px; }
   .count { color: var(--muted); font-size: 13px; }
@@ -746,7 +760,7 @@ TEMPLATE = r"""<!DOCTYPE html>
 <div class="cards">
   <div class="metric"><div class="v">{{ records|length }}</div><div class="l">genomes</div></div>
   <div class="metric"><div class="v">{{ type_counts|length }}</div><div class="l">LPS types</div></div>
-  <div class="metric"><div class="v">{{ pheno_counts|reject("equalto", "uncertain")|list|length }}</div><div class="l">phenotypes</div></div>
+  <div class="metric"><div class="v">{{ pheno_counts|reject("in", ["uncertain", "Not predicted"])|list|length }}</div><div class="l">phenotypes</div></div>
   <div class="metric"><div class="v">{{ n_flagged }}</div><div class="l">flagged genomes</div></div>
 </div>
 {% if meta.steps %}<p class="sub"><b>Steps run:</b> {{ meta.steps }}</p>{% endif %}
@@ -762,7 +776,8 @@ TEMPLATE = r"""<!DOCTYPE html>
 <table id="summary" class="data-table">
   <thead><tr>
     <th data-filter="text">Sample</th><th data-filter="select">Species</th>
-    <th data-filter="select">Type</th><th data-filter="multi">Subtype(s)</th><th data-filter="multi">Phenotype</th>
+    <th data-filter="select">Type</th><th data-filter="multi">Subtype(s)</th><th data-filter="select">Subtype status</th>
+    <th data-filter="multi">Phenotype</th>
     <th data-filter="multi">Basis</th>
     <th data-filter="select">MLST</th><th data-filter="select">petG</th>
     <th data-type="num" data-filter="range">Compl.</th><th data-type="num" data-filter="range">Contam.</th><th data-filter="multi">Flags</th>
@@ -773,8 +788,9 @@ TEMPLATE = r"""<!DOCTYPE html>
       <td><a href="#g-{{ r.sample }}">{{ r.sample }}</a></td>
       <td>{% if r.species %}<i>{{ r.species }}</i>{% else %}<span class="muted">—</span>{% endif %}</td>
       <td>{{ r.type or "—" }}</td>
-      <td data-sort="{{ r.subtypes|join(', ') }}">{% for s in r.subtypes %}<span class="pill">{{ s }}</span>{% else %}<span class="muted">—</span>{% endfor %}</td>
-      <td data-sort="{{ r.phenotypes.keys()|join(', ') }}">{% for p, d in r.phenotypes.items() %}<span class="pill" title="{{ d }}">{{ p }}</span>{% else %}<span class="muted">—</span>{% endfor %}</td>
+      <td data-sort="{{ r.subtypes|join(', ') }}">{% for s in r.subtypes %}<span class="pill{% if s == 'Not assigned' %} none{% endif %}">{{ s }}</span>{% else %}<span class="muted">—</span>{% endfor %}</td>
+      <td>{{ r.subtype_status|replace("_", " ") or "—" }}</td>
+      <td data-sort="{{ r.phenotypes.keys()|join(', ') if r.phenotypes else ('Not predicted' if r.not_predicted else '') }}">{% for p, d in r.phenotypes.items() %}<span class="pill" title="{{ d }}">{{ p }}</span>{% else %}{% if r.not_predicted %}<span class="pill none" title="{{ r.basis }}">Not predicted</span>{% else %}<span class="muted">—</span>{% endif %}{% endfor %}</td>
       <td data-sort="{{ r.basis_labels|join(', ') }}">{% for b in r.basis_labels %}<span class="pill basis-{{ b.split(' ')[0] }}" title="{{ r.basis }}">{{ b }}</span>{% else %}<span class="muted">—</span>{% endfor %}</td>
       <td>{{ r.mlst or "—" }}</td>
       <td data-sort="{{ r.petg }}"><span class="nowrap {{ r.petg_class }}" title="{{ r.petg_detail }}">{{ r.petg }}</span></td>
@@ -880,16 +896,17 @@ TEMPLATE = r"""<!DOCTYPE html>
 {% endif %}
 {% for r in records.values() %}
 <details id="g-{{ r.sample }}" {% if records|length == 1 %}open{% endif %}>
-  <summary>{{ r.sample }} — {{ r.type or "untypeable" }}{% if r.phenotypes %} · {{ r.phenotypes.keys()|join(", ") }}{% endif %}</summary>
+  <summary>{{ r.sample }} — {{ r.type or "untypeable" }}{% if r.phenotypes %} · {{ r.phenotypes.keys()|join(", ") }}{% elif r.not_predicted %} · Not predicted{% endif %}</summary>
   <div style="display:flex; flex-wrap:wrap; gap:24px;">
     <div style="flex:1; min-width:320px;">
       <div class="kv">
         <span class="k">LPS type</span><span>{{ r.type or "—" }}</span>
         <span class="k">Subtype(s)</span><span>{{ r.subtypes|join(", ") or "—" }}</span>
-        <span class="k">Phenotype</span><span>{% for p,d in r.phenotypes.items() %}{{ p }}{% if d %} ({{ d }}){% endif %}{% if not loop.last %}; {% endif %}{% else %}—{% endfor %}</span>
+        <span class="k">Subtype status</span><span>{{ r.subtype_status|replace("_", " ") or "—" }}</span>
+        <span class="k">Phenotype</span><span>{% for p,d in r.phenotypes.items() %}{{ p }}{% if d %} ({{ d }}){% endif %}{% if not loop.last %}; {% endif %}{% else %}{{ "Not predicted" if r.not_predicted else "—" }}{% endfor %}</span>
         <span class="k">MLST</span><span>{{ r.mlst or "—" }}</span>
         <span class="k">Phenotype basis</span><span>{{ r.basis or "—" }}</span>
-        <span class="k">LPS gene states</span><span>{{ r.gene_states or "all rule genes functional" }}</span>
+        <span class="k">LPS gene states</span><span>{% if r.gene_states %}{{ r.gene_states }}{% elif r.subtype_status in ("not_assessed", "not_applicable") %}—{% else %}all rule genes functional{% endif %}</span>
         <span class="k">petG</span><span><span class="{{ r.petg_class }}">{{ r.petg }}</span>{% if r.petg_detail %} <span class="muted">({{ r.petg_detail }})</span>{% endif %}</span>
         <span class="k">Species</span><span><i>{{ r.species or "—" }}</i></span>
         <span class="k">Completeness / contam.</span><span>{{ r.completeness or "—" }} / {{ r.contamination or "—" }}</span>
@@ -901,7 +918,7 @@ TEMPLATE = r"""<!DOCTYPE html>
       <table><thead><tr><th>Gene</th><th>Pos</th><th>Ref&rarr;Alt</th><th>Type</th><th>Subtype</th></tr></thead>
       <tbody>{% for v in r.variants %}<tr><td>{{ v.gene or "—" }}</td><td>{{ v.pos }}</td>
         <td>{{ v.ref }}&rarr;{{ v.alt }}</td><td>{{ v.vartype }}</td><td>{{ v.subtype }}</td></tr>{% endfor %}</tbody></table>
-      {% else %}<p class="muted">No subtype-database mutations matched.</p>{% endif %}
+      {% else %}<p class="muted">{% if r.subtype_status == "reference_identical" %}No variants in the LPS locus: identical to the reference.{% elif r.subtype_status == "not_assessed" %}Variant calling was not assessed for this genome.{% elif r.subtype_status == "uncurated_variants" %}Variants were found in the LPS locus, but none is in the subtype database.{% else %}No subtype-database mutations matched.{% endif %}</p>{% endif %}
     </div>
     {% if r.pheno_img %}<div style="width:240px;"><img src="{{ r.pheno_img }}" alt="phenotype" style="width:100%; background:#f6f8fa; border-radius:8px;"></div>{% endif %}
   </div>
@@ -1125,6 +1142,8 @@ def main(argv=None):
         # An uncertain call lists several alternatives; count it once, as "uncertain".
         if len(r["phenotypes"]) > 1:
             pheno_counts["uncertain"] = pheno_counts.get("uncertain", 0) + 1
+        if r["not_predicted"]:
+            pheno_counts[NOT_PREDICTED] = pheno_counts.get(NOT_PREDICTED, 0) + 1
         for p, d in r["phenotypes"].items():
             if len(r["phenotypes"]) == 1:
                 pheno_counts[p] = pheno_counts.get(p, 0) + 1
@@ -1143,7 +1162,7 @@ def main(argv=None):
 
     # phenotype gallery (observed, sorted)
     pheno_gallery = []
-    for p in sorted(k for k in pheno_counts if k != "uncertain"):
+    for p in sorted(k for k in pheno_counts if k not in ("uncertain", NOT_PREDICTED)):
         pheno_gallery.append({
             "id": p, "desc": (": " + pheno_desc[p]) if pheno_desc.get(p) else "",
             "count": pheno_counts[p], "img": pheno_images.get(p),
